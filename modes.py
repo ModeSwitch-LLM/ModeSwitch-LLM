@@ -1,0 +1,387 @@
+"""
+modes.py
+
+Backend-facing mode utilities for ModeSwitch-LLM.
+
+Purpose:
+- interpret abstract fixed inference modes from config.py
+- convert them into backend/runtime-specific argument dictionaries
+
+Design principle:
+config.py = what modes exist
+modes.py  = how those modes map to runnable settings
+"""
+
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional
+
+from config import CONFIG, ModeConfig, get_mode_by_name
+
+
+# =============================================================================
+# Backend-facing runtime mode representation
+# =============================================================================
+
+@dataclass
+class RuntimeMode:
+    """
+    Concrete runtime-ready representation of a mode.
+
+    This is the object returned by the mode builder and later consumed by
+    model_loader.py / runner.py.
+    """
+
+    # Canonical mode name
+    name: str
+
+    # Short description
+    description: str
+
+    # Backend/runtime, e.g. "vllm", "transformers"
+    backend: str
+
+    # Precision / dtype if relevant
+    dtype: Optional[str] = None
+
+    # Quantization label if relevant
+    quantization: Optional[str] = None
+
+    # High-level phase this mode primarily targets
+    primary_phase: str = "both"
+
+    # Human notes for logging / debugging
+    notes: str = ""
+
+    # Generic feature toggles
+    speculative_decoding: bool = False
+    kv_cache_compression: bool = False
+    prefix_caching: bool = False
+    chunked_prefill: bool = False
+    continuous_batching: bool = False
+    cuda_graphs: bool = False
+
+    # Backend-specific runtime kwargs
+    runtime_kwargs: Dict[str, Any] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert the dataclass into a plain dictionary.
+        """
+        output = asdict(self)
+        if output["runtime_kwargs"] is None:
+            output["runtime_kwargs"] = {}
+        return output
+
+
+# =============================================================================
+# Validation helpers
+# =============================================================================
+
+def validate_mode_config(mode: ModeConfig) -> None:
+    """
+    Basic validation checks for a mode before converting it to runtime form.
+    """
+    if mode.backend not in {"vllm", "transformers", "tgi"}:
+        raise ValueError(
+            f"Unsupported backend '{mode.backend}' for mode '{mode.name}'."
+        )
+
+    if mode.quantization is not None and mode.dtype is not None:
+        # This is not always illegal, but it can often indicate confusion.
+        # Keep it strict for now to reduce ambiguity.
+        pass
+
+    if mode.primary_phase not in {"prefill", "decode", "both"}:
+        raise ValueError(
+            f"Mode '{mode.name}' has invalid primary_phase='{mode.primary_phase}'."
+        )
+
+
+# =============================================================================
+# Backend mapping logic
+# =============================================================================
+
+def _build_vllm_runtime_kwargs(mode: ModeConfig) -> Dict[str, Any]:
+    """
+    Convert a ModeConfig into a vLLM-oriented kwargs dictionary.
+
+    NOTE:
+    These keys are deliberately generic for now. Later, once your exact
+    runtime/API entrypoint is finalized, you can adapt the names to match
+    your actual LLM(...) constructor or serve command.
+    """
+    kwargs: Dict[str, Any] = {}
+
+    # Baseline dtype
+    if mode.dtype is not None:
+        kwargs["dtype"] = mode.dtype
+
+    # Quantization modes
+    if mode.quantization is not None:
+        kwargs["quantization"] = mode.quantization
+
+    # Feature toggles
+    if mode.speculative_decoding:
+        kwargs["speculative_decoding"] = True
+
+    if mode.kv_cache_compression:
+        kwargs["kv_cache_compression"] = True
+
+    if mode.prefix_caching:
+        kwargs["enable_prefix_caching"] = True
+
+    if mode.chunked_prefill:
+        kwargs["enable_chunked_prefill"] = True
+
+    if mode.continuous_batching:
+        kwargs["enable_continuous_batching"] = True
+
+    if mode.cuda_graphs:
+        kwargs["enable_cuda_graphs"] = True
+
+    # Merge any custom extras last so they can override defaults if needed
+    kwargs.update(mode.extra_args)
+
+    return kwargs
+
+
+def _build_transformers_runtime_kwargs(mode: ModeConfig) -> Dict[str, Any]:
+    """
+    Convert a ModeConfig into a Transformers-oriented kwargs dictionary.
+
+    These settings are placeholders / adapter-level fields that you can later
+    translate into actual AutoModel / quantization / generate() settings.
+    """
+    kwargs: Dict[str, Any] = {}
+
+    if mode.dtype is not None:
+        kwargs["torch_dtype"] = mode.dtype
+
+    if mode.quantization is not None:
+        kwargs["quantization"] = mode.quantization
+
+    if mode.speculative_decoding:
+        kwargs["speculative_decoding"] = True
+
+    if mode.kv_cache_compression:
+        kwargs["kv_cache_compression"] = True
+
+    if mode.prefix_caching:
+        kwargs["prefix_caching"] = True
+
+    if mode.chunked_prefill:
+        kwargs["chunked_prefill"] = True
+
+    if mode.continuous_batching:
+        kwargs["continuous_batching"] = True
+
+    if mode.cuda_graphs:
+        kwargs["cuda_graphs"] = True
+
+    kwargs.update(mode.extra_args)
+
+    return kwargs
+
+
+def _build_tgi_runtime_kwargs(mode: ModeConfig) -> Dict[str, Any]:
+    """
+    Convert a ModeConfig into a TGI-oriented kwargs dictionary.
+    """
+    kwargs: Dict[str, Any] = {}
+
+    if mode.dtype is not None:
+        kwargs["dtype"] = mode.dtype
+
+    if mode.quantization is not None:
+        kwargs["quantization"] = mode.quantization
+
+    if mode.speculative_decoding:
+        kwargs["speculative_decoding"] = True
+
+    if mode.kv_cache_compression:
+        kwargs["kv_cache_compression"] = True
+
+    if mode.prefix_caching:
+        kwargs["prefix_caching"] = True
+
+    if mode.chunked_prefill:
+        kwargs["chunked_prefill"] = True
+
+    if mode.continuous_batching:
+        kwargs["continuous_batching"] = True
+
+    if mode.cuda_graphs:
+        kwargs["cuda_graphs"] = True
+
+    kwargs.update(mode.extra_args)
+
+    return kwargs
+
+
+# =============================================================================
+# Public builders
+# =============================================================================
+
+def build_runtime_mode(mode: ModeConfig) -> RuntimeMode:
+    """
+    Convert an abstract ModeConfig into a concrete RuntimeMode object.
+    """
+    validate_mode_config(mode)
+
+    if mode.backend == "vllm":
+        runtime_kwargs = _build_vllm_runtime_kwargs(mode)
+    elif mode.backend == "transformers":
+        runtime_kwargs = _build_transformers_runtime_kwargs(mode)
+    elif mode.backend == "tgi":
+        runtime_kwargs = _build_tgi_runtime_kwargs(mode)
+    else:
+        raise ValueError(f"Unsupported backend '{mode.backend}'.")
+
+    notes_parts: List[str] = []
+    if mode.quantization:
+        notes_parts.append(f"quantization={mode.quantization}")
+    if mode.speculative_decoding:
+        notes_parts.append("speculative decoding enabled")
+    if mode.kv_cache_compression:
+        notes_parts.append("KV-cache compression enabled")
+    if mode.prefix_caching:
+        notes_parts.append("prefix caching enabled")
+    if mode.chunked_prefill:
+        notes_parts.append("chunked prefill enabled")
+    if mode.continuous_batching:
+        notes_parts.append("continuous batching enabled")
+    if mode.cuda_graphs:
+        notes_parts.append("CUDA graphs enabled")
+
+    notes = "; ".join(notes_parts) if notes_parts else "standard mode"
+
+    return RuntimeMode(
+        name=mode.name,
+        description=mode.description,
+        backend=mode.backend,
+        dtype=mode.dtype,
+        quantization=mode.quantization,
+        primary_phase=mode.primary_phase,
+        notes=notes,
+        speculative_decoding=mode.speculative_decoding,
+        kv_cache_compression=mode.kv_cache_compression,
+        prefix_caching=mode.prefix_caching,
+        chunked_prefill=mode.chunked_prefill,
+        continuous_batching=mode.continuous_batching,
+        cuda_graphs=mode.cuda_graphs,
+        runtime_kwargs=runtime_kwargs,
+    )
+
+
+def build_runtime_mode_by_name(mode_name: str) -> RuntimeMode:
+    """
+    Fetch a mode from config.py by name and build its concrete runtime form.
+    """
+    mode = get_mode_by_name(mode_name)
+    return build_runtime_mode(mode)
+
+
+def get_all_runtime_modes(enabled_only: bool = True) -> List[RuntimeMode]:
+    """
+    Build all configured modes into runtime-ready objects.
+    """
+    modes = CONFIG.modes
+    if enabled_only:
+        modes = [mode for mode in modes if mode.enabled]
+
+    return [build_runtime_mode(mode) for mode in modes]
+
+
+# =============================================================================
+# Hybrid modes
+# =============================================================================
+
+def build_hybrid_mode(
+    name: str,
+    base_mode_name: str,
+    extra_flags: Dict[str, Any],
+    description: Optional[str] = None,
+    primary_phase: Optional[str] = None,
+) -> RuntimeMode:
+    """
+    Build a hybrid mode by starting from an existing configured mode and
+    overlaying additional runtime flags.
+
+    Example use:
+        build_hybrid_mode(
+            name="awq_plus_kv_cache",
+            base_mode_name="awq_4bit",
+            extra_flags={"kv_cache_compression": True},
+            description="4-bit AWQ with KV-cache compression",
+            primary_phase="decode",
+        )
+    """
+    base_mode = get_mode_by_name(base_mode_name)
+    runtime_mode = build_runtime_mode(base_mode)
+
+    # Override the public metadata
+    runtime_mode.name = name
+    runtime_mode.description = description or f"Hybrid mode based on {base_mode_name}"
+    if primary_phase is not None:
+        runtime_mode.primary_phase = primary_phase
+
+    # Apply high-level flags if present
+    if "speculative_decoding" in extra_flags:
+        runtime_mode.speculative_decoding = bool(extra_flags["speculative_decoding"])
+    if "kv_cache_compression" in extra_flags:
+        runtime_mode.kv_cache_compression = bool(extra_flags["kv_cache_compression"])
+    if "prefix_caching" in extra_flags:
+        runtime_mode.prefix_caching = bool(extra_flags["prefix_caching"])
+    if "chunked_prefill" in extra_flags:
+        runtime_mode.chunked_prefill = bool(extra_flags["chunked_prefill"])
+    if "continuous_batching" in extra_flags:
+        runtime_mode.continuous_batching = bool(extra_flags["continuous_batching"])
+    if "cuda_graphs" in extra_flags:
+        runtime_mode.cuda_graphs = bool(extra_flags["cuda_graphs"])
+
+    # Apply / merge backend kwargs
+    if runtime_mode.runtime_kwargs is None:
+        runtime_mode.runtime_kwargs = {}
+    runtime_mode.runtime_kwargs.update(extra_flags)
+
+    # Rebuild notes
+    notes_parts: List[str] = [f"hybrid from {base_mode_name}"]
+    for key, value in extra_flags.items():
+        notes_parts.append(f"{key}={value}")
+    runtime_mode.notes = "; ".join(notes_parts)
+
+    return runtime_mode
+
+
+# =============================================================================
+# Convenience hybrid registry
+# =============================================================================
+
+def get_default_hybrid_modes() -> List[RuntimeMode]:
+    """
+    Return a small set of optional hybrid modes that may be useful later.
+    Keep these out of the main config until you actually want to benchmark them.
+    """
+    hybrids: List[RuntimeMode] = []
+
+    hybrids.append(
+        build_hybrid_mode(
+            name="awq_plus_kv_cache",
+            base_mode_name="awq_4bit",
+            extra_flags={"kv_cache_compression": True},
+            description="4-bit AWQ with KV-cache compression",
+            primary_phase="decode",
+        )
+    )
+
+    hybrids.append(
+        build_hybrid_mode(
+            name="awq_plus_speculative",
+            base_mode_name="awq_4bit",
+            extra_flags={"speculative_decoding": True},
+            description="4-bit AWQ with speculative decoding",
+            primary_phase="decode",
+        )
+    )
+
+    return hybrids

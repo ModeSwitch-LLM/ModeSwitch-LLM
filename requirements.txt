@@ -1,0 +1,29 @@
+# Core model / tokenizer stack
+transformers>=4.44.0
+tokenizers>=0.19.1
+huggingface_hub>=0.23.0
+sentencepiece>=0.2.0
+safetensors>=0.4.3
+
+# vLLM backend
+vllm>=0.5.4
+
+# PyTorch
+torch>=2.3.0
+
+# Quantization / efficiency
+bitsandbytes>=0.43.1
+autoawq>=0.2.6
+
+# Data / results handling
+pandas>=2.2.2
+numpy>=1.26.4
+
+# Plotting / analysis
+matplotlib>=3.9.0
+jupyter>=1.0.0
+notebook>=7.2.0
+
+# Utilities
+tqdm>=4.66.4
+psutil>=5.9.8
