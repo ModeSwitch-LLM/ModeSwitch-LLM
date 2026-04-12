@@ -61,7 +61,7 @@ class ModelConfig:
 
     # Primary runtime/backend to use.
     # Examples: "transformers", "vllm", "tgi"
-    backend: str = "vllm"
+    backend: str = "transformers"
 
     # Primary device for inference.
     device: str = "cuda"
@@ -167,7 +167,7 @@ class ModeConfig:
     category: str
 
     # Backend/runtime used by this mode.
-    backend: str = "vllm"
+    backend: str = "transformers"
 
     # Primary dtype or precision label if relevant.
     dtype: Optional[str] = None

@@ -22,9 +22,10 @@ from config import CONFIG
 from modes import RuntimeMode
 
 try:
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, AutoModelForCausalLM
 except ImportError:
     AutoTokenizer = None
+    AutoModelForCausalLM = None
 
 try:
     from vllm import LLM
@@ -119,13 +120,48 @@ def _load_vllm_model(runtime_mode: RuntimeMode):
 
 def _load_transformers_model(runtime_mode: RuntimeMode):
     """
-    Placeholder for Transformers backend support.
-
-    Add real implementation once you decide to support this path.
+    Load a Hugging Face Transformers causal LM for the provided runtime mode.
     """
-    raise NotImplementedError(
-        "Transformers backend loader is not implemented yet."
+    if AutoModelForCausalLM is None:
+        raise ImportError(
+            "transformers is not installed, so the Transformers backend cannot be used."
+        )
+
+    model_kwargs = {
+        "trust_remote_code": CONFIG.model.trust_remote_code,
+    }
+
+    # Map dtype string from config/runtime mode to torch dtype
+    dtype_str = runtime_mode.dtype or CONFIG.model.baseline_dtype
+    if torch is not None:
+        dtype_map = {
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+        }
+        if dtype_str in dtype_map:
+            model_kwargs["torch_dtype"] = dtype_map[dtype_str]
+
+    # Very basic quantization placeholders for future extension
+    if runtime_mode.quantization is not None:
+        raise NotImplementedError(
+            f"Transformers quantization path for '{runtime_mode.quantization}' "
+            "is not implemented yet in model_loader.py."
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        CONFIG.model.model_name_or_path,
+        **model_kwargs,
     )
+
+    if torch is not None and torch.cuda.is_available() and CONFIG.model.device.startswith("cuda"):
+        model = model.to(CONFIG.model.device)
+
+    model.eval()
+    return model
 
 
 def _load_tgi_model(runtime_mode: RuntimeMode):

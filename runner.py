@@ -97,6 +97,52 @@ def _run_vllm_generate(bundle: LoadedModelBundle, workload: RuntimeWorkload):
 
     return output_text, first_token_time_s, token_timestamps_s, end_time_s
 
+def _run_transformers_generate(bundle: LoadedModelBundle, workload: RuntimeWorkload):
+    """
+    Run generation using the Hugging Face Transformers backend.
+
+    Notes:
+    - This is a simple non-streaming implementation for baseline testing.
+    - TTFT/TBT are not exact yet here either.
+    """
+    tokenizer = bundle.tokenizer
+    model = bundle.model
+
+    encoded = tokenizer(
+        workload.prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=CONFIG.model.max_model_len,
+    )
+
+    if torch is not None and torch.cuda.is_available() and CONFIG.model.device.startswith("cuda"):
+        encoded = {k: v.to(CONFIG.model.device) for k, v in encoded.items()}
+
+    start_generation_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **encoded,
+            max_new_tokens=workload.max_new_tokens,
+            do_sample=CONFIG.generation.do_sample,
+            temperature=CONFIG.generation.temperature,
+            top_p=CONFIG.generation.top_p,
+            repetition_penalty=CONFIG.generation.repetition_penalty,
+            num_return_sequences=CONFIG.generation.num_return_sequences,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    end_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
+
+    input_len = encoded["input_ids"].shape[1]
+    generated_ids = output_ids[0][input_len:]
+    output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    # Still approximate for now
+    first_token_time_s = start_generation_time_s
+    token_timestamps_s = []
+
+    return output_text, first_token_time_s, token_timestamps_s, end_time_s
 
 def _run_generation(bundle: LoadedModelBundle, workload: RuntimeWorkload):
     """
@@ -104,7 +150,8 @@ def _run_generation(bundle: LoadedModelBundle, workload: RuntimeWorkload):
     """
     if bundle.backend == "vllm":
         return _run_vllm_generate(bundle, workload)
-
+    if bundle.backend == "transformers":
+        return _run_transformers_generate(bundle, workload)
     raise NotImplementedError(
         f"Generation runner for backend '{bundle.backend}' is not implemented yet."
     )
