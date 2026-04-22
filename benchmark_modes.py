@@ -98,6 +98,7 @@ def save_summary_csv(results: List[BenchmarkResult], output_path: Path) -> None:
             "workload_name": r.workload_name,
             "backend": r.backend,
             "trial_index": r.trial_index,
+            "num_requests_in_batch": r.num_requests_in_batch,
             "total_latency_ms": r.total_latency_ms,
             "tokens_per_second": r.tokens_per_second,
             "output_tokens_generated": r.output_tokens_generated,
@@ -161,7 +162,9 @@ def run_full_benchmark(
     for mode in runtime_modes:
         print(f"\n[MODE] {mode.name} | backend={mode.backend} | phase={mode.primary_phase}")
         print(f"       notes: {mode.notes}")
-
+        print(f"       engine kwargs: {mode.runtime_kwargs}")
+        if mode.runner_kwargs:
+            print(f"       runner kwargs: {mode.runner_kwargs}")
         for workload in runtime_workloads:
             print(f"  [WORKLOAD] {summarize_workload(workload)}")
 

@@ -47,6 +47,7 @@ class BenchmarkResult:
     max_new_tokens: int
     repeated_prefix: bool = False
     memory_pressure: bool = False
+    num_requests_in_batch: int = 1
 
     # Raw timing fields
     start_time_s: Optional[float] = None

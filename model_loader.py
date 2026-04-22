@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import gc
+import os
 
 from config import CONFIG
 from modes import RuntimeMode
@@ -27,10 +28,7 @@ except ImportError:
     AutoTokenizer = None
     AutoModelForCausalLM = None
 
-try:
-    from vllm import LLM
-except ImportError:
-    LLM = None
+LLM = None
 
 try:
     import torch
@@ -61,6 +59,58 @@ class LoadedModelBundle:
 # =============================================================================
 # Tokenizer loading
 # =============================================================================
+def _resolve_hf_token() -> Optional[str]:
+    """
+    Resolve a Hugging Face token from the configured environment variable.
+    """
+    env_var = CONFIG.model.hf_token_env_var
+    if not env_var:
+        return None
+    token = os.environ.get(env_var)
+    return token or None
+
+
+def _get_vllm_llm_class():
+    """
+    Lazily import the vLLM LLM class.
+    """
+    global LLM
+
+    if LLM is None:
+        try:
+            from vllm import LLM as _LLM
+        except ImportError as exc:
+            raise ImportError(
+                "vllm is not installed, so the vLLM backend cannot be used."
+            ) from exc
+        LLM = _LLM
+
+    return LLM
+
+
+def _resolve_model_name_or_path(runtime_mode: RuntimeMode) -> str:
+    """
+    Resolve the actual model path for a runtime mode.
+    """
+    override = runtime_mode.runtime_kwargs.get("model_name_or_path")
+    return override or CONFIG.model.model_name_or_path
+
+
+def _resolve_tokenizer_name_or_path(runtime_mode: RuntimeMode, model_name_or_path: str) -> str:
+    """
+    Resolve the tokenizer path.
+
+    Keep tokenizer selection stable across quantized checkpoints unless the mode
+    explicitly overrides it.
+    """
+    override = runtime_mode.runtime_kwargs.get("tokenizer_name_or_path")
+    if override:
+        return override
+    if CONFIG.model.tokenizer_name_or_path is not None:
+        return CONFIG.model.tokenizer_name_or_path
+    return model_name_or_path
+
+
 
 def load_tokenizer():
     """
@@ -74,16 +124,21 @@ def load_tokenizer():
             "transformers is not installed, so AutoTokenizer cannot be loaded."
         )
 
-    tokenizer_path = (
-        CONFIG.model.tokenizer_name_or_path
-        if CONFIG.model.tokenizer_name_or_path is not None
-        else CONFIG.model.model_name_or_path
-    )
+    if tokenizer_path is None:
+        tokenizer_path = (
+            CONFIG.model.tokenizer_name_or_path
+            if CONFIG.model.tokenizer_name_or_path is not None
+            else CONFIG.model.model_name_or_path
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
         trust_remote_code=CONFIG.model.trust_remote_code,
+        token=_resolve_hf_token(),
     )
+
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     return tokenizer
 
@@ -101,20 +156,37 @@ def _load_vllm_model(runtime_mode: RuntimeMode):
       vLLM version and which features are supported in Python API vs CLI.
     - For now, we pass through the runtime kwargs and keep the loader modular.
     """
-    if LLM is None:
-        raise ImportError("vllm is not installed, so the vLLM backend cannot be used.")
+    LLMClass = _get_vllm_llm_class()
+
+    model_name_or_path = _resolve_model_name_or_path(runtime_mode)
+    tokenizer_name_or_path = _resolve_tokenizer_name_or_path(
+        runtime_mode,
+        model_name_or_path=model_name_or_path,
+    )
 
     llm_kwargs = {
-        "model": CONFIG.model.model_name_or_path,
+        "model": model_name_or_path,
+        "tokenizer": tokenizer_name_or_path,
         "trust_remote_code": CONFIG.model.trust_remote_code,
         "max_model_len": CONFIG.model.max_model_len,
+        "tensor_parallel_size": CONFIG.model.tensor_parallel_size,
+        "gpu_memory_utilization": CONFIG.model.gpu_memory_utilization,
+        "swap_space": CONFIG.model.swap_space_gb,
+        "max_num_batched_tokens": CONFIG.model.max_num_batched_tokens,
+        "max_num_seqs": CONFIG.model.max_num_seqs,
+        "disable_log_stats": True,
     }
 
     # Merge in mode-specific runtime kwargs
-    if runtime_mode.runtime_kwargs is not None:
-        llm_kwargs.update(runtime_mode.runtime_kwargs)
+    llm_kwargs.update(
+        {
+            key: value
+            for key, value in runtime_mode.runtime_kwargs.items()
+            if key not in {"model_name_or_path", "tokenizer_name_or_path"}
+        }
+    )
 
-    model = LLM(**llm_kwargs)
+    model = LLMClass(**llm_kwargs)
     return model
 
 
@@ -145,7 +217,7 @@ def _load_transformers_model(runtime_mode: RuntimeMode):
         if dtype_str in dtype_map:
             model_kwargs["torch_dtype"] = dtype_map[dtype_str]
 
-    # Very basic quantization placeholders for future extension
+    # Do not fake quantization in the legacy Transformers path.
     if runtime_mode.quantization is not None:
         raise NotImplementedError(
             f"Transformers quantization path for '{runtime_mode.quantization}' "
@@ -193,10 +265,18 @@ def load_model_for_mode(runtime_mode: RuntimeMode) -> LoadedModelBundle:
     tokenizer = load_tokenizer()
 
     if runtime_mode.backend == "vllm":
+        model_name_or_path = _resolve_model_name_or_path(runtime_mode)
+        tokenizer_name_or_path = _resolve_tokenizer_name_or_path(
+            runtime_mode,
+            model_name_or_path=model_name_or_path,
+        )
+        tokenizer = load_tokenizer(tokenizer_name_or_path)
         model = _load_vllm_model(runtime_mode)
     elif runtime_mode.backend == "transformers":
+        tokenizer = load_tokenizer()
         model = _load_transformers_model(runtime_mode)
     elif runtime_mode.backend == "tgi":
+        tokenizer = load_tokenizer()
         model = _load_tgi_model(runtime_mode)
     else:
         raise ValueError(f"Unsupported backend: {runtime_mode.backend}")

@@ -37,6 +37,11 @@ class RuntimeWorkload:
     # Actual input prompt text
     prompt: str
 
+    # Optional follow-up prompt used for repeated-prefix experiments.
+    # When present, the benchmark runner can issue `prompt` first to prime the
+    # engine and then time `followup_prompt` on the same engine instance.
+    followup_prompt: Optional[str] = None
+
     # Max new tokens to generate
     max_new_tokens: int
 
@@ -183,10 +188,16 @@ def build_runtime_workload(
     """
     Convert an abstract WorkloadConfig into a concrete RuntimeWorkload.
     """
+    followup_prompt = None
+
     if workload.repeated_prefix:
         prompt = _build_repeated_prefix_prompt(
             prompt_tokens=workload.prompt_tokens,
             variant_id=repeated_prefix_variant,
+        )
+        followup_prompt = _build_repeated_prefix_prompt(
+            prompt_tokens=workload.prompt_tokens,
+            variant_id=repeated_prefix_variant + 1,
         )
     elif workload.memory_pressure:
         prompt = _build_memory_pressure_prompt(
@@ -203,10 +214,12 @@ def build_runtime_workload(
 
     if workload.repeated_prefix:
         metadata["repeated_prefix_variant"] = repeated_prefix_variant
+        metadata["followup_repeated_prefix_variant"] = repeated_prefix_variant + 1
 
     return RuntimeWorkload(
         name=workload.name,
         prompt=prompt,
+        followup_prompt=followup_prompt,
         max_new_tokens=workload.max_new_tokens,
         description=workload.description,
         prompt_tokens_target=workload.prompt_tokens,

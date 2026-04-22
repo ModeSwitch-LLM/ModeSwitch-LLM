@@ -54,10 +54,10 @@ class ModelConfig:
     """
 
     # Hugging Face model name or local checkpoint path.
-    model_name_or_path: str = "meta-llama/Llama-3.1-8B-Instruct"
+    model_name_or_path: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
     # Separate tokenizer path. Usually same as model path.
-    tokenizer_name_or_path: Optional[str] = None
+    tokenizer_name_or_path: Optional[str] = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
     # Primary runtime/backend to use.
     # Examples: "transformers", "vllm", "tgi"
@@ -76,6 +76,38 @@ class ModelConfig:
     # Maximum context length to assume for runs if needed.
     max_model_len: int = 4096
 
+    # Tensor parallel replicas for vLLM.
+    tensor_parallel_size: int = 1
+
+    # Fraction of GPU memory that vLLM is allowed to use.
+    # Keep this below 1.0 so the engine has room for runtime buffers / KV cache
+    # without immediately OOMing on a 40 GB class GPU.
+    gpu_memory_utilization: float = 0.82
+
+    # CPU swap space exposed to vLLM (GiB per GPU).
+    swap_space_gb: int = 4
+
+    # Scheduling / batching defaults.
+    max_num_batched_tokens: int = 2048
+    max_num_seqs: int = 8
+
+    # CUDA-graph capture window used when graph mode is enabled.
+    max_seq_len_to_capture: int = 2048
+
+    # Baseline policy:
+    # make the FP16 baseline eager so the CUDA-graphs mode is a real ablation.
+    enforce_eager_baseline: bool = True
+
+    # Optional alternate checkpoints for quantized / draft-model runs.
+    # These are real model IDs rather than fake "turn the base checkpoint into
+    # AWQ/GPTQ/INT8 with one flag" placeholders.
+    int8_model_name_or_path: Optional[str] = "RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8"
+    awq_model_name_or_path: Optional[str] = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+    gptq_model_name_or_path: Optional[str] = "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
+    speculative_model_name_or_path: Optional[str] = "meta-llama/Llama-3.2-1B-Instruct"
+
+    # Environment variable to use for gated / authenticated HF downloads.
+    hf_token_env_var: str = "HF_TOKEN"
 
 @dataclass
 class GenerationConfig:
@@ -142,6 +174,9 @@ class SystemConfig:
     # Optional timeout per run in seconds.
     run_timeout_s: Optional[float] = None
 
+    # For the "continuous batching" benchmark mode, measure a small multi-request
+    # batch on one engine instance.
+    continuous_batching_batch_size: int = 4
 
 # =============================================================================
 # Mode definitions
@@ -246,54 +281,88 @@ DEFAULT_MODES: List[ModeConfig] = [
         name="fp16_baseline",
         description="FP16 baseline inference mode",
         category="baseline",
+        backend="vllm",
         dtype="float16",
         primary_phase="both",
+        extra_args={
+            # Make the baseline a real eager baseline so CUDA-graphs mode is
+            # a meaningful ablation instead of already being implicitly enabled.
+            "enforce_eager": True,
+        },
         enabled=True,
     ),
     ModeConfig(
         name="int8_quant",
-        description="INT8 quantized inference mode",
+        description="INT8 W8A8 quantized checkpoint mode",
         category="quantization",
-        quantization="int8",
+        backend="vllm",
+        # Red Hat / Neural Magic W8A8 checkpoints are loaded as real quantized
+        # checkpoints. Let vLLM infer from the model config when possible.
+        quantization="compressed-tensors",
         primary_phase="decode",
+        extra_args={
+            "model_name_or_path": "RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8",
+            "dtype": "auto",
+        },
         enabled=True,
     ),
     ModeConfig(
         name="awq_4bit",
         description="4-bit AWQ quantized inference mode",
         category="quantization",
+        backend="vllm",
         quantization="awq",
         primary_phase="decode",
+        extra_args={
+            "model_name_or_path": "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+            "dtype": "float16",
+        },
         enabled=True,
     ),
     ModeConfig(
         name="gptq_4bit",
         description="4-bit GPTQ quantized inference mode",
         category="quantization",
+        backend="vllm",
         quantization="gptq",
         primary_phase="decode",
-        enabled=False, 
+        extra_args={
+            "model_name_or_path": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+            "dtype": "float16",
+        },
+        enabled=True,
     ),
     ModeConfig(
         name="speculative_decoding",
         description="Speculative decoding mode",
         category="decoding",
+        backend="vllm",
         speculative_decoding=True,
         primary_phase="decode",
-        enabled=False,
+        extra_args={
+            "speculative_model": "meta-llama/Llama-3.2-1B-Instruct",
+            "num_speculative_tokens": 5,
+        },
+        enabled=True,
     ),
     ModeConfig(
         name="kv_cache_compression",
-        description="KV-cache compression / quantization mode",
+        description="Quantized KV-cache mode",
         category="cache",
+        backend="vllm",
         kv_cache_compression=True,
         primary_phase="decode",
-        enabled=False,
+        extra_args={
+            "kv_cache_dtype": "fp8_e4m3",
+            "calculate_kv_scales": True,
+        },
+        enabled=True,
     ),
     ModeConfig(
         name="prefix_caching",
         description="Automatic prefix caching mode",
         category="cache",
+        backend="vllm",
         prefix_caching=True,
         primary_phase="prefill",
         enabled=True,
@@ -302,25 +371,41 @@ DEFAULT_MODES: List[ModeConfig] = [
         name="chunked_prefill",
         description="Chunked prefill scheduling mode",
         category="scheduler",
+        backend="vllm",
         chunked_prefill=True,
         primary_phase="prefill",
+        extra_args={
+            # Keep the batched-token budget tight enough that long prompts can
+            # actually be chunked rather than always fitting in one shot.
+            "max_num_batched_tokens": 1024,
+        },
         enabled=True,
     ),
     ModeConfig(
         name="continuous_batching",
         description="Continuous batching mode",
         category="scheduler",
+        backend="vllm",
         continuous_batching=True,
         primary_phase="decode",
-        enabled=False,
+        extra_args={
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 2048,
+        },
+        enabled=True,
     ),
     ModeConfig(
         name="cuda_graphs",
         description="CUDA graph capture / replay mode",
         category="runtime",
+        backend="vllm",
         cuda_graphs=True,
         primary_phase="both",
-        enabled=False,
+        extra_args={
+            "enforce_eager": False,
+            "max_seq_len_to_capture": 2048,
+        },
+        enabled=True,
     ),
 ]
 
