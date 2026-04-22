@@ -137,7 +137,7 @@ def _build_vllm_runtime_kwargs(mode: ModeConfig) -> Dict[str, Any]:
         kwargs["enable_continuous_batching"] = True
 
     if mode.cuda_graphs:
-        kwargs["enable_cuda_graphs"] = True
+        kwargs["enable_cuda_graphs"] = False
 
     # Merge any custom extras last so they can override defaults if needed
     kwargs.update(mode.extra_args)
@@ -366,21 +366,11 @@ def get_default_hybrid_modes() -> List[RuntimeMode]:
 
     hybrids.append(
         build_hybrid_mode(
-            name="awq_plus_kv_cache",
+            name="awq_plus_chunked_prefill",
             base_mode_name="awq_4bit",
-            extra_flags={"kv_cache_compression": True},
-            description="4-bit AWQ with KV-cache compression",
-            primary_phase="decode",
-        )
-    )
-
-    hybrids.append(
-        build_hybrid_mode(
-            name="awq_plus_speculative",
-            base_mode_name="awq_4bit",
-            extra_flags={"speculative_decoding": True},
-            description="4-bit AWQ with speculative decoding",
-            primary_phase="decode",
+            extra_flags={"enable_chunked_prefill": True, "chunked_prefill": True},
+            description="4-bit AWQ with chunked prefill",
+            primary_phase="both",
         )
     )
 

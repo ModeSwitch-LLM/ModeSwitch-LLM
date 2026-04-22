@@ -61,7 +61,7 @@ class ModelConfig:
 
     # Primary runtime/backend to use.
     # Examples: "transformers", "vllm", "tgi"
-    backend: str = "transformers"
+    backend: str = "vllm"
 
     # Primary device for inference.
     device: str = "cuda"
@@ -74,7 +74,7 @@ class ModelConfig:
     trust_remote_code: bool = True
 
     # Maximum context length to assume for runs if needed.
-    max_model_len: int = 8192
+    max_model_len: int = 4096
 
 
 @dataclass
@@ -119,7 +119,7 @@ class SystemConfig:
     warmup_runs: int = 1
 
     # Number of measured trials per (mode, workload) pair.
-    num_trials: int = 3
+    num_trials: int = 2
 
     # Whether to clear CUDA cache between runs.
     clear_cuda_cache_between_runs: bool = True
@@ -134,7 +134,7 @@ class SystemConfig:
     collect_memory_stats: bool = True
 
     # Whether to collect power / energy stats if supported.
-    collect_energy_stats: bool = True
+    collect_energy_stats: bool = False
 
     # Interval in seconds for optional power polling.
     power_poll_interval_s: float = 0.05
@@ -167,7 +167,7 @@ class ModeConfig:
     category: str
 
     # Backend/runtime used by this mode.
-    backend: str = "transformers"
+    backend: str = "vllm"
 
     # Primary dtype or precision label if relevant.
     dtype: Optional[str] = None
@@ -248,6 +248,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="baseline",
         dtype="float16",
         primary_phase="both",
+        enabled=True,
     ),
     ModeConfig(
         name="int8_quant",
@@ -255,6 +256,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="quantization",
         quantization="int8",
         primary_phase="decode",
+        enabled=True,
     ),
     ModeConfig(
         name="awq_4bit",
@@ -262,6 +264,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="quantization",
         quantization="awq",
         primary_phase="decode",
+        enabled=True,
     ),
     ModeConfig(
         name="gptq_4bit",
@@ -269,7 +272,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="quantization",
         quantization="gptq",
         primary_phase="decode",
-        enabled=True, 
+        enabled=False, 
     ),
     ModeConfig(
         name="speculative_decoding",
@@ -277,6 +280,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="decoding",
         speculative_decoding=True,
         primary_phase="decode",
+        enabled=False,
     ),
     ModeConfig(
         name="kv_cache_compression",
@@ -284,6 +288,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="cache",
         kv_cache_compression=True,
         primary_phase="decode",
+        enabled=False,
     ),
     ModeConfig(
         name="prefix_caching",
@@ -291,6 +296,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="cache",
         prefix_caching=True,
         primary_phase="prefill",
+        enabled=True,
     ),
     ModeConfig(
         name="chunked_prefill",
@@ -298,6 +304,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="scheduler",
         chunked_prefill=True,
         primary_phase="prefill",
+        enabled=True,
     ),
     ModeConfig(
         name="continuous_batching",
@@ -305,6 +312,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="scheduler",
         continuous_batching=True,
         primary_phase="decode",
+        enabled=False,
     ),
     ModeConfig(
         name="cuda_graphs",
@@ -312,6 +320,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         category="runtime",
         cuda_graphs=True,
         primary_phase="both",
+        enabled=False,
     ),
 ]
 
@@ -330,31 +339,31 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
     WorkloadConfig(
         name="short_prompt_long_output",
         prompt_tokens=128,
-        max_new_tokens=256,
+        max_new_tokens=128,
         description="Short prompt, long output",
     ),
     WorkloadConfig(
         name="long_prompt_short_output",
-        prompt_tokens=2048,
+        prompt_tokens=1024,
         max_new_tokens=32,
         description="Long prompt, short output",
     ),
     WorkloadConfig(
         name="long_prompt_long_output",
-        prompt_tokens=2048,
-        max_new_tokens=256,
+        prompt_tokens=1024,
+        max_new_tokens=128,
         description="Long prompt, long output",
     ),
     WorkloadConfig(
         name="shared_prefix_chat",
         prompt_tokens=1024,
-        max_new_tokens=128,
+        max_new_tokens=64,
         description="Shared-prefix workload for prefix caching experiments",
         repeated_prefix=True,
     ),
     WorkloadConfig(
         name="memory_pressure_long_context",
-        prompt_tokens=4096,
+        prompt_tokens=2048,
         max_new_tokens=128,
         description="Long-context workload under artificial memory pressure",
         memory_pressure=True,

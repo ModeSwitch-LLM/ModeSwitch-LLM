@@ -86,6 +86,37 @@ def save_results_csv(results: List[BenchmarkResult], output_path: Path) -> None:
         writer.writeheader()
         writer.writerows(result_dicts)
 
+def save_summary_csv(results: List[BenchmarkResult], output_path: Path) -> None:
+    """
+    Save a compact summary focused on the metrics we trust for tomorrow:
+    total latency, output length, rough throughput, and memory.
+    """
+    rows = []
+    for r in results:
+        rows.append({
+            "mode_name": r.mode_name,
+            "workload_name": r.workload_name,
+            "backend": r.backend,
+            "trial_index": r.trial_index,
+            "total_latency_ms": r.total_latency_ms,
+            "tokens_per_second": r.tokens_per_second,
+            "output_tokens_generated": r.output_tokens_generated,
+            "peak_gpu_memory_mb": r.peak_gpu_memory_mb,
+            "reserved_gpu_memory_mb": r.reserved_gpu_memory_mb,
+            "error": r.error,
+            "notes": r.notes,
+        })
+
+    if not rows:
+        with open(output_path, "w", encoding="utf-8", newline="") as f:
+            f.write("")
+        return
+
+    fieldnames = list(rows[0].keys())
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 # =============================================================================
 # Benchmark sweep logic
@@ -182,19 +213,22 @@ def main() -> None:
     timestamp = _timestamp_str()
 
     results = run_full_benchmark(
-        include_hybrids=False,
+        include_hybrids=True,
         repeated_prefix_variants=2,
     )
 
     json_path = RAW_RESULTS_DIR / f"benchmark_results_{timestamp}.json"
     csv_path = RAW_RESULTS_DIR / f"benchmark_results_{timestamp}.csv"
+    summary_csv_path = RAW_RESULTS_DIR / f"benchmark_summary_{timestamp}.csv"
 
     save_results_json(results, json_path)
     save_results_csv(results, csv_path)
+    save_summary_csv(results, summary_csv_path)
 
     print("\nSaved results:")
     print(f"  JSON: {json_path}")
     print(f"  CSV : {csv_path}")
+    print(f"  Summary CSV : {summary_csv_path}")
 
 
 if __name__ == "__main__":

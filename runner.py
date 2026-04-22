@@ -14,7 +14,7 @@ metrics.py = metric computation
 """
 
 from typing import Optional
-
+from threading import Thread
 from config import CONFIG
 from modes import RuntimeMode, build_runtime_mode_by_name
 from model_loader import LoadedModelBundle, load_model_for_mode, unload_model
@@ -31,6 +31,10 @@ try:
 except ImportError:
     torch = None
 
+try:
+    from transformers import TextIteratorStreamer
+except ImportError:
+    TextIteratorStreamer = None
 
 # =============================================================================
 # Helper functions
@@ -87,10 +91,11 @@ def _run_vllm_generate(bundle: LoadedModelBundle, workload: RuntimeWorkload):
         if outputs[0].outputs and len(outputs[0].outputs) > 0:
             output_text = outputs[0].outputs[0].text
 
+    output_text = output_text.replace("</s>", "").strip()
+
     # Since this path is non-streaming, we do not have exact first-token timestamps yet.
-    # For now, approximate first token time as the overall generation start time.
-    # This keeps the pipeline working but should be improved later if TTFT is critical.
-    first_token_time_s = start_generation_time_s
+    # Keep TTFT/TBT as approximate placeholders only.
+    first_token_time_s = end_time_s
 
     # No per-token timestamps yet in this basic implementation
     token_timestamps_s = []
@@ -102,9 +107,14 @@ def _run_transformers_generate(bundle: LoadedModelBundle, workload: RuntimeWorkl
     Run generation using the Hugging Face Transformers backend.
 
     Notes:
-    - This is a simple non-streaming implementation for baseline testing.
-    - TTFT/TBT are not exact yet here either.
+    - This uses a streamer so TTFT and TBT are based on actual
+      streamed output arrival times
     """
+    if TextIteratorStreamer is None:
+        raise ImportError(
+            "transformers TextIteratorStreamer is unavailable. Please update transformers."
+        )
+
     tokenizer = bundle.tokenizer
     model = bundle.model
 
@@ -118,29 +128,66 @@ def _run_transformers_generate(bundle: LoadedModelBundle, workload: RuntimeWorkl
     if torch is not None and torch.cuda.is_available() and CONFIG.model.device.startswith("cuda"):
         encoded = {k: v.to(CONFIG.model.device) for k, v in encoded.items()}
 
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+    )
+
+    generate_kwargs = {
+        **encoded,
+        "max_new_tokens": workload.max_new_tokens,
+        "do_sample": CONFIG.generation.do_sample,
+        "repetition_penalty": CONFIG.generation.repetition_penalty,
+        "num_return_sequences": CONFIG.generation.num_return_sequences,
+        "pad_token_id": tokenizer.eos_token_id,
+        "streamer": streamer,
+    }
+
+    # Only include sampling params when sampling is enabled.
+    if CONFIG.generation.do_sample:
+        generate_kwargs["temperature"] = CONFIG.generation.temperature
+        generate_kwargs["top_p"] = CONFIG.generation.top_p
+        if CONFIG.generation.top_k > 0:
+            generate_kwargs["top_k"] = CONFIG.generation.top_k
+
     start_generation_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            **encoded,
-            max_new_tokens=workload.max_new_tokens,
-            do_sample=CONFIG.generation.do_sample,
-            temperature=CONFIG.generation.temperature,
-            top_p=CONFIG.generation.top_p,
-            repetition_penalty=CONFIG.generation.repetition_penalty,
-            num_return_sequences=CONFIG.generation.num_return_sequences,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+    generation_thread = Thread(
+        target=model.generate,
+        kwargs=generate_kwargs,
+        daemon=True,
+    )
+    generation_thread.start()
 
+    output_chunks = []
+    token_timestamps_s = []
+    first_token_time_s = None
+
+    for new_text in streamer:
+        current_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
+        output_chunks.append(new_text)
+
+        # Record first arrival time once.
+        if first_token_time_s is None and new_text.strip() != "":
+            first_token_time_s = current_time_s
+
+        # Record timestamp for each non-empty streamed chunk.
+        if new_text.strip() != "":
+            token_timestamps_s.append(current_time_s)
+
+    generation_thread.join()
     end_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
 
-    input_len = encoded["input_ids"].shape[1]
-    generated_ids = output_ids[0][input_len:]
-    output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    output_text = "".join(output_chunks)
 
-    # Still approximate for now
-    first_token_time_s = start_generation_time_s
-    token_timestamps_s = []
+    # Safety cleanup: remove any leftover special end-of-sequence markers
+    # that may still appear in streamed text on some models/setups.
+    output_text = output_text.replace("</s>", "").strip()
+
+    # Fallback in case streamer yields nothing useful.
+    if first_token_time_s is None:
+        first_token_time_s = end_time_s
 
     return output_text, first_token_time_s, token_timestamps_s, end_time_s
 
@@ -214,6 +261,17 @@ def run_single_benchmark(
         result.token_timestamps_s = token_timestamps_s
         result.output_text = output_text
         result.output_tokens_generated = _count_output_tokens(bundle.tokenizer, output_text)
+
+        if runtime_mode.backend == "vllm":
+            result.notes = (
+                "Primary trusted metrics for this run: total latency, memory, output tokens, "
+                "and rough throughput. TTFT/TBT are approximate in the current offline vLLM path."
+            )
+        elif runtime_mode.backend == "transformers":
+            result.notes = (
+                "Transformers streamer path uses chunk-level arrival timing; "
+                "TTFT/TBT are approximate."
+            )
 
         # Finalize derived metrics
         result = finalize_benchmark_result(result)

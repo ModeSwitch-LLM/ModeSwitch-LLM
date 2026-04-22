@@ -149,7 +149,7 @@ def _load_transformers_model(runtime_mode: RuntimeMode):
     if runtime_mode.quantization is not None:
         raise NotImplementedError(
             f"Transformers quantization path for '{runtime_mode.quantization}' "
-            "is not implemented yet in model_loader.py."
+            "is intentionally disabled for the main benchmark path. Use backend='vllm'."
         )
 
     model = AutoModelForCausalLM.from_pretrained(
