@@ -1,0 +1,14 @@
+transformers
+tokenizers
+huggingface_hub
+sentencepiece
+safetensors
+torch
+vllm
+pandas
+numpy
+matplotlib
+jupyter
+notebook
+tqdm
+psutil
