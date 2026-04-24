@@ -318,8 +318,21 @@ def build_runtime_mode_by_name(mode_name: str) -> RuntimeMode:
     """
     Fetch a mode from config.py by name and build its concrete runtime form.
     """
-    mode = get_mode_by_name(mode_name)
-    return build_runtime_mode(mode)
+    try:
+        mode = get_mode_by_name(mode_name)
+        return build_runtime_mode(mode)
+    except ValueError as original_exc:
+        # Also allow resolving names from the default hybrid registry so
+        # standalone helpers like run_single_benchmark_by_name(...) can run
+        # hybrid modes directly.
+        for hybrid_mode in get_default_hybrid_modes():
+            if hybrid_mode.name == mode_name:
+                return hybrid_mode
+
+        raise ValueError(
+            f"Unknown mode name: {mode_name}. "
+            "It was not found in CONFIG.modes or in the default hybrid registry."
+        ) from original_exc
 
 
 def get_all_runtime_modes(enabled_only: bool = True) -> List[RuntimeMode]:

@@ -14,6 +14,7 @@ from reporter import (
     prepare_results,
 )
 
+from modes import build_runtime_mode_by_name
 
 def _make_fake_result(
     mode_name: str = "fp16_baseline",
@@ -292,8 +293,22 @@ class TestParetoFrontier(unittest.TestCase):
         self.assertNotIn("quant_bad", modes)
 
 
-class TestMarkdownReport(unittest.TestCase):
+class TestModeResolution(unittest.TestCase):
 
+    def test_hybrid_prefix_mode_can_be_built_by_name(self):
+        mode = build_runtime_mode_by_name("gptq_plus_prefix_caching")
+        self.assertEqual(mode.name, "gptq_plus_prefix_caching")
+        self.assertTrue(mode.prefix_caching)
+        self.assertEqual(mode.quantization, "gptq")
+
+    def test_hybrid_cont_batch_mode_can_be_built_by_name(self):
+        mode = build_runtime_mode_by_name("int8_plus_continuous_batching")
+        self.assertEqual(mode.name, "int8_plus_continuous_batching")
+        self.assertTrue(mode.continuous_batching)
+        self.assertEqual(mode.quantization, "compressed-tensors")
+
+
+class TestMarkdownReport(unittest.TestCase):
     def test_markdown_report_generation(self):
         results = [
             _make_fake_result(mode_name="fp16_baseline"),
