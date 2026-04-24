@@ -88,7 +88,7 @@ class ModelConfig:
     swap_space_gb: int = 4
 
     # Scheduling / batching defaults.
-    max_num_batched_tokens: int = 2048
+    max_num_batched_tokens: int = 4096
     max_num_seqs: int = 8
 
     # CUDA-graph capture window used when graph mode is enabled.
@@ -166,7 +166,13 @@ class SystemConfig:
     collect_memory_stats: bool = True
 
     # Whether to collect power / energy stats if supported.
-    collect_energy_stats: bool = False
+    collect_energy_stats: bool = True
+
+    # Whether to collect CPU RAM stats.
+    collect_cpu_memory_stats: bool = True
+
+    # Whether to compute quality metrics when a reference is available.
+    collect_quality_metrics: bool = True
 
     # Interval in seconds for optional power polling.
     power_poll_interval_s: float = 0.05
@@ -178,6 +184,9 @@ class SystemConfig:
     # batch on one engine instance.
     continuous_batching_batch_size: int = 4
 
+    # Baseline mode used for baseline-quality comparisons in postprocessing.
+    baseline_reference_mode_name: str = "fp16_baseline"
+    
 # =============================================================================
 # Mode definitions
 # =============================================================================
@@ -261,6 +270,18 @@ class WorkloadConfig:
 
     # Optional human-readable description.
     description: str = ""
+
+    # Task label used in reporting / grouping.
+    task_type: Optional[str] = None
+
+    # Explicit workload cell label (SS / SL / LS / LL).
+    workload_cell: Optional[str] = None
+
+    # Named system condition associated with this workload.
+    system_condition: Optional[str] = None
+
+    # Reference output for lightweight quality checks.
+    reference_output: Optional[str] = None
 
     # Whether this workload is meant to test shared-prefix behavior.
     repeated_prefix: bool = False
@@ -354,7 +375,6 @@ DEFAULT_MODES: List[ModeConfig] = [
         primary_phase="decode",
         extra_args={
             "kv_cache_dtype": "fp8_e4m3",
-            "calculate_kv_scales": True,
         },
         enabled=True,
     ),
@@ -375,9 +395,8 @@ DEFAULT_MODES: List[ModeConfig] = [
         chunked_prefill=True,
         primary_phase="prefill",
         extra_args={
-            # Keep the batched-token budget tight enough that long prompts can
-            # actually be chunked rather than always fitting in one shot.
-            "max_num_batched_tokens": 1024,
+            # Must stay >= max_model_len, otherwise vLLM rejects the engine config.
+            "max_num_batched_tokens": 4096,
         },
         enabled=True,
     ),
@@ -390,7 +409,7 @@ DEFAULT_MODES: List[ModeConfig] = [
         primary_phase="decode",
         extra_args={
             "max_num_seqs": 4,
-            "max_num_batched_tokens": 2048,
+            "max_num_batched_tokens": 4096,
         },
         enabled=True,
     ),
@@ -420,24 +439,32 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         prompt_tokens=128,
         max_new_tokens=32,
         description="Short prompt, short output",
+        task_type="qa",
+        workload_cell="SS",
     ),
     WorkloadConfig(
         name="short_prompt_long_output",
         prompt_tokens=128,
         max_new_tokens=128,
         description="Short prompt, long output",
+        task_type="qa",
+        workload_cell="SL",
     ),
     WorkloadConfig(
         name="long_prompt_short_output",
         prompt_tokens=1024,
         max_new_tokens=32,
         description="Long prompt, short output",
+        task_type="analysis",
+        workload_cell="LS",
     ),
     WorkloadConfig(
         name="long_prompt_long_output",
         prompt_tokens=1024,
         max_new_tokens=128,
         description="Long prompt, long output",
+        task_type="analysis",
+        workload_cell="LL",
     ),
     WorkloadConfig(
         name="shared_prefix_chat",
@@ -445,6 +472,9 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         max_new_tokens=64,
         description="Shared-prefix workload for prefix caching experiments",
         repeated_prefix=True,
+        task_type="chat",
+        workload_cell="LS",
+        metadata={"workload_family": "shared_prefix"},
     ),
     WorkloadConfig(
         name="memory_pressure_long_context",
@@ -452,6 +482,10 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         max_new_tokens=128,
         description="Long-context workload under artificial memory pressure",
         memory_pressure=True,
+        task_type="analysis",
+        workload_cell="LS",
+        system_condition="mem_pressure_50",
+        metadata={"workload_family": "memory_pressure"},
     ),
 ]
 

@@ -141,7 +141,6 @@ def _build_vllm_runtime_kwargs(mode: ModeConfig) -> Dict[str, Any]:
     # KV cache quantization
     if mode.kv_cache_compression:
         kwargs["kv_cache_dtype"] = "fp8_e4m3"
-        kwargs["calculate_kv_scales"] = True
 
     if mode.prefix_caching:
         kwargs["enable_prefix_caching"] = True
@@ -401,12 +400,25 @@ def get_default_hybrid_modes() -> List[RuntimeMode]:
 
     hybrids.append(
         build_hybrid_mode(
-            name="awq_plus_chunked_prefill",
-            base_mode_name="awq_4bit",
-            extra_flags={"chunked_prefill": True, "max_num_batched_tokens": 1024},
-            description="4-bit AWQ with chunked prefill",
+            name="gptq_plus_prefix_caching",
+            base_mode_name="gptq_4bit",
+            extra_flags={"prefix_caching": True},
+            description="4-bit GPTQ with automatic prefix caching",
             primary_phase="both",
         )
     )
 
+    hybrids.append(
+        build_hybrid_mode(
+            name="int8_plus_continuous_batching",
+            base_mode_name="int8_quant",
+            extra_flags={
+                "continuous_batching": True,
+                "max_num_seqs": CONFIG.system.continuous_batching_batch_size,
+                "max_num_batched_tokens": CONFIG.model.max_num_batched_tokens,
+            },
+            description="INT8 quantized mode with continuous batching",
+            primary_phase="decode",
+        )
+    )
     return hybrids

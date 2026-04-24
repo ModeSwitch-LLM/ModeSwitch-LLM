@@ -23,12 +23,14 @@ from config import CONFIG
 from modes import RuntimeMode
 
 try:
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 except ImportError:
     AutoTokenizer = None
     AutoModelForCausalLM = None
+    AutoConfig = None
 
-LLM = None
+AsyncEngineArgs = None
+AsyncVLLMEngine = None
 
 try:
     import torch
@@ -54,6 +56,7 @@ class LoadedModelBundle:
     tokenizer: Any
     model: Any
     runtime_mode: RuntimeMode
+    hf_model_config: Any = None
 
 
 # =============================================================================
@@ -72,20 +75,29 @@ def _resolve_hf_token() -> Optional[str]:
 
 def _get_vllm_llm_class():
     """
-    Lazily import the vLLM LLM class.
+    Lazily import the vLLM async engine classes.
     """
-    global LLM
+    global AsyncEngineArgs, AsyncVLLMEngine
 
-    if LLM is None:
+    if AsyncEngineArgs is None or AsyncVLLMEngine is None:
         try:
-            from vllm import LLM as _LLM
+            from vllm.engine.arg_utils import AsyncEngineArgs as _AsyncEngineArgs
         except ImportError as exc:
             raise ImportError(
-                "vllm is not installed, so the vLLM backend cannot be used."
+                "vllm async engine args are unavailable. Please check the installed vLLM version."
             ) from exc
-        LLM = _LLM
 
-    return LLM
+        try:
+            from vllm.engine.async_llm_engine import AsyncLLMEngine as _AsyncVLLMEngine
+        except ImportError as exc:
+            raise ImportError(
+                "AsyncLLMEngine is unavailable in this vLLM installation."
+            ) from exc
+
+        AsyncEngineArgs = _AsyncEngineArgs
+        AsyncVLLMEngine = _AsyncVLLMEngine
+
+    return AsyncEngineArgs, AsyncVLLMEngine
 
 
 def _resolve_model_name_or_path(runtime_mode: RuntimeMode) -> str:
@@ -112,7 +124,7 @@ def _resolve_tokenizer_name_or_path(runtime_mode: RuntimeMode, model_name_or_pat
 
 
 
-def load_tokenizer():
+def load_tokenizer(tokenizer_path: Optional[str] = None):
     """
     Load the tokenizer specified in the global config.
 
@@ -149,14 +161,13 @@ def load_tokenizer():
 
 def _load_vllm_model(runtime_mode: RuntimeMode):
     """
-    Load a vLLM model for the provided runtime mode.
+    Load a vLLM async engine for the provided runtime mode.
 
     Notes:
-    - The exact kwargs here may need adjustment depending on your installed
-      vLLM version and which features are supported in Python API vs CLI.
-    - For now, we pass through the runtime kwargs and keep the loader modular.
+    - We use AsyncLLMEngine rather than offline LLM so the benchmark runner
+      can measure streamed TTFT/TBT from real incremental outputs.
     """
-    LLMClass = _get_vllm_llm_class()
+    AsyncEngineArgsClass, AsyncVLLMEngineClass = _get_vllm_llm_class()
 
     model_name_or_path = _resolve_model_name_or_path(runtime_mode)
     tokenizer_name_or_path = _resolve_tokenizer_name_or_path(
@@ -164,7 +175,7 @@ def _load_vllm_model(runtime_mode: RuntimeMode):
         model_name_or_path=model_name_or_path,
     )
 
-    llm_kwargs = {
+    engine_kwargs = {
         "model": model_name_or_path,
         "tokenizer": tokenizer_name_or_path,
         "trust_remote_code": CONFIG.model.trust_remote_code,
@@ -178,7 +189,7 @@ def _load_vllm_model(runtime_mode: RuntimeMode):
     }
 
     # Merge in mode-specific runtime kwargs
-    llm_kwargs.update(
+    engine_kwargs.update(
         {
             key: value
             for key, value in runtime_mode.runtime_kwargs.items()
@@ -186,7 +197,8 @@ def _load_vllm_model(runtime_mode: RuntimeMode):
         }
     )
 
-    model = LLMClass(**llm_kwargs)
+    engine_args = AsyncEngineArgsClass(**engine_kwargs)
+    model = AsyncVLLMEngineClass.from_engine_args(engine_args)
     return model
 
 
@@ -262,7 +274,7 @@ def load_model_for_mode(runtime_mode: RuntimeMode) -> LoadedModelBundle:
     Returns:
         LoadedModelBundle containing tokenizer, model, and metadata
     """
-    tokenizer = load_tokenizer()
+    hf_model_config = None
 
     if runtime_mode.backend == "vllm":
         model_name_or_path = _resolve_model_name_or_path(runtime_mode)
@@ -271,9 +283,27 @@ def load_model_for_mode(runtime_mode: RuntimeMode) -> LoadedModelBundle:
             model_name_or_path=model_name_or_path,
         )
         tokenizer = load_tokenizer(tokenizer_name_or_path)
+        if AutoConfig is not None:
+            try:
+                hf_model_config = AutoConfig.from_pretrained(
+                    model_name_or_path,
+                    trust_remote_code=CONFIG.model.trust_remote_code,
+                    token=_resolve_hf_token(),
+                )
+            except Exception:
+                hf_model_config = None
         model = _load_vllm_model(runtime_mode)
     elif runtime_mode.backend == "transformers":
         tokenizer = load_tokenizer()
+        if AutoConfig is not None:
+            try:
+                hf_model_config = AutoConfig.from_pretrained(
+                    CONFIG.model.model_name_or_path,
+                    trust_remote_code=CONFIG.model.trust_remote_code,
+                    token=_resolve_hf_token(),
+                )
+            except Exception:
+                hf_model_config = None
         model = _load_transformers_model(runtime_mode)
     elif runtime_mode.backend == "tgi":
         tokenizer = load_tokenizer()
@@ -287,6 +317,7 @@ def load_model_for_mode(runtime_mode: RuntimeMode) -> LoadedModelBundle:
         tokenizer=tokenizer,
         model=model,
         runtime_mode=runtime_mode,
+        hf_model_config=hf_model_config,
     )
 
 
@@ -302,6 +333,20 @@ def unload_model(bundle: Optional[LoadedModelBundle]) -> None:
     """
     if bundle is None:
         return
+
+    try:
+        shutdown_background_loop = getattr(bundle.model, "shutdown_background_loop", None)
+        if callable(shutdown_background_loop):
+            shutdown_background_loop()
+    except Exception:
+        pass
+
+    try:
+        shutdown = getattr(bundle.model, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+    except Exception:
+        pass
 
     try:
         del bundle.model

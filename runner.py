@@ -12,16 +12,27 @@ Design principle:
 runner.py = execution orchestration
 metrics.py = metric computation
 """
-
+import asyncio
+import logging
+import re
+import uuid
+import time
+import warnings
 from typing import List, Optional
-from threading import Thread
+from threading import Thread, Event
 from config import CONFIG
 from modes import RuntimeMode, build_runtime_mode_by_name
 from model_loader import LoadedModelBundle, load_model_for_mode, unload_model
 from workloads import RuntimeWorkload, build_runtime_workload_by_name
 from metrics import (
     BenchmarkResult,
+    compute_exact_match,
+    compute_rouge_l_f1,
+    compute_token_f1,
     finalize_benchmark_result,
+    get_current_gpu_allocated_mb,
+    get_process_ram_mb,
+    get_reserved_gpu_memory_mb,
     now_s,
     reset_gpu_peak_memory_stats,
 )
@@ -32,6 +43,11 @@ except ImportError:
     torch = None
 
 try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
+try:
     from transformers import TextIteratorStreamer
 except ImportError:
     TextIteratorStreamer = None
@@ -39,6 +55,198 @@ except ImportError:
 # =============================================================================
 # Helper functions
 # =============================================================================
+class EnergyPoller:
+    """
+    Lightweight background GPU power poller.
+
+    This is adapted from Ali's phase_monitor.py, but simplified to fit the
+    current runner architecture. It is used only for total timed-run energy /
+    average power collection.
+    """
+
+    def __init__(self, poll_interval_s: float, device_index: int = 0):
+        self._poll_interval_s = poll_interval_s
+        self._device_index = device_index
+        self._available = False
+        self._samples_w = []
+        self._stop_event = Event()
+        self._thread: Optional[Thread] = None
+        self._nvml_initialized = False
+        self._handle = None
+
+        if (
+            pynvml is None
+            or torch is None
+            or not torch.cuda.is_available()
+            or not CONFIG.system.collect_energy_stats
+        ):
+            return
+
+        try:
+            pynvml.nvmlInit()
+            self._nvml_initialized = True
+            if torch.cuda.is_available():
+                current_device = torch.cuda.current_device()
+            else:
+                current_device = device_index
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(current_device)
+            self._available = True
+        except Exception:
+            self._handle = None
+            self._available = False
+
+    def _poll_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                power_mw = pynvml.nvmlDeviceGetPowerUsage(self._handle)
+                self._samples_w.append((time.perf_counter(), power_mw / 1000.0))
+            except Exception:
+                pass
+            self._stop_event.wait(self._poll_interval_s)
+
+    def __enter__(self) -> "EnergyPoller":
+        if not self._available:
+            return self
+        self._samples_w.clear()
+        self._stop_event.clear()
+        self._thread = Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._available:
+            self._stop_event.set()
+            if self._thread is not None:
+                self._thread.join(timeout=2.0)
+        if self._nvml_initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml_initialized = False
+
+    def get_total_energy_joules(self) -> Optional[float]:
+        """
+        Integrate sampled power over time using trapezoids.
+        """
+        if not self._available or len(self._samples_w) < 2:
+            return None
+
+        total_j = 0.0
+        for i in range(1, len(self._samples_w)):
+            t0, w0 = self._samples_w[i - 1]
+            t1, w1 = self._samples_w[i]
+            dt = t1 - t0
+            total_j += 0.5 * (w0 + w1) * dt
+        return total_j
+
+    def get_mean_power_watts(self) -> Optional[float]:
+        if not self._available or not self._samples_w:
+            return None
+        return sum(w for _, w in self._samples_w) / len(self._samples_w)
+
+
+class MemoryPressureContext:
+    """
+    Allocate a dummy CUDA tensor to consume a fraction of currently free VRAM.
+
+    Adapted from Ali's phase_monitor.py and simplified for the current runner.
+    """
+
+    def __init__(self, vram_fraction: float = 0.0, device: str = "cuda"):
+        self._fraction = max(0.0, min(float(vram_fraction), 0.9))
+        self._device = device
+        self._pressure_tensor = None
+        self._stats = {}
+
+    def __enter__(self) -> "MemoryPressureContext":
+        if self._fraction <= 0.0 or torch is None or not torch.cuda.is_available():
+            return self
+
+        try:
+            total_bytes = torch.cuda.get_device_properties(self._device).total_memory
+            allocated_bytes = torch.cuda.memory_allocated(self._device)
+            free_bytes = max(0, total_bytes - allocated_bytes)
+            target_bytes = int(free_bytes * self._fraction)
+
+            self._stats["free_before_gb"] = free_bytes / (1024 ** 3)
+            self._stats["target_allocation_gb"] = target_bytes / (1024 ** 3)
+
+            if target_bytes <= 0:
+                return self
+
+            # float16 -> 2 bytes per element
+            n_elements = max(1, target_bytes // 2)
+            self._pressure_tensor = torch.empty(
+                n_elements,
+                dtype=torch.float16,
+                device=self._device,
+            )
+            self._pressure_tensor.fill_(0.0)
+
+            actual_allocated_bytes = (
+                self._pressure_tensor.element_size() * self._pressure_tensor.numel()
+            )
+            free_after_bytes = max(
+                0,
+                total_bytes - torch.cuda.memory_allocated(self._device),
+            )
+
+            self._stats["actual_allocated_gb"] = actual_allocated_bytes / (1024 ** 3)
+            self._stats["free_after_gb"] = free_after_bytes / (1024 ** 3)
+        except torch.cuda.OutOfMemoryError:
+            self._pressure_tensor = None
+            self._stats["allocation_error"] = "OutOfMemoryError"
+        except Exception as exc:
+            self._pressure_tensor = None
+            self._stats["allocation_error"] = str(exc)
+
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._pressure_tensor is not None:
+            try:
+                del self._pressure_tensor
+            except Exception:
+                pass
+            self._pressure_tensor = None
+
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    def get_stats(self) -> dict:
+        return dict(self._stats)
+
+
+def _resolve_memory_pressure_fraction(workload: RuntimeWorkload) -> float:
+    """
+    Infer the desired artificial VRAM pressure fraction from workload metadata.
+
+    Priority:
+    1. explicit workload.memory_pressure_fraction attribute if present
+    2. workload.system_condition_name naming convention
+    3. fallback for boolean workload.memory_pressure
+    """
+    explicit_fraction = getattr(workload, "memory_pressure_fraction", None)
+    if explicit_fraction is not None:
+        try:
+            return max(0.0, min(float(explicit_fraction), 0.9))
+        except Exception:
+            pass
+
+    system_condition_name = str(getattr(workload, "system_condition_name", "") or "").lower()
+    if "75" in system_condition_name:
+        return 0.75
+    if "50" in system_condition_name:
+        return 0.50
+
+    if getattr(workload, "memory_pressure", False):
+        return 0.50
+
+    return 0.0
 
 def _count_output_tokens(tokenizer, output_text: str) -> Optional[int]:
     """
@@ -71,7 +279,45 @@ def _sanitize_output_text(text: str) -> str:
     """
     Remove simple special-token artifacts that can still appear in text output.
     """
-    return (text or "").replace("</s>", "").strip()
+    cleaned = text or ""
+
+    # Remove common full special-token remnants first.
+    cleaned = cleaned.replace("</s>", "").replace("<s>", "")
+
+    # Sometimes streamed / decoded text leaves a truncated leading fragment
+    # like "s>" after stripping a broken "</s>" boundary.
+    cleaned = re.sub(r"^(?:\s*(?:s>|/s>|</s>|<s>))+", "", cleaned)
+
+    return cleaned.strip()
+
+
+def _configure_quieter_runtime_logs() -> None:
+    """
+    Reduce noisy benchmark-time logging from upstream libraries.
+    """
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*torch_dtype.*deprecated.*dtype instead.*",
+    )
+
+    # Hide very verbose vLLM startup/info logs while still letting actual
+    # exceptions propagate back through the benchmark result.
+    logging.getLogger("vllm").setLevel(logging.ERROR)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+
+
+def _filter_reporting_token_ids(tokenizer, token_ids: List[int]) -> List[int]:
+    """
+    Filter token ids to the subset we want to count/report.
+
+    We exclude tokenizer special tokens (EOS/BOS/PAD/etc.) so the streamed
+    token count lines up with the human-visible decoded output.
+    """
+    if tokenizer is None:
+        return list(token_ids)
+
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    return [token_id for token_id in token_ids if token_id not in special_ids]
 
 
 def _build_warmup_prompts(batch_size: int = 1) -> List[str]:
@@ -100,6 +346,304 @@ def _build_batched_prompts(base_prompt: str, batch_size: int) -> List[str]:
         )
     return prompts
 
+def _estimate_bytes_per_element_from_runtime_mode(runtime_mode: RuntimeMode) -> int:
+    """
+    Estimate bytes per KV-cache element from the configured KV-cache dtype.
+    """
+    kv_cache_dtype = runtime_mode.runtime_kwargs.get("kv_cache_dtype")
+    if kv_cache_dtype is None or kv_cache_dtype == "auto":
+        dtype_label = runtime_mode.runtime_kwargs.get("dtype", runtime_mode.dtype or CONFIG.model.baseline_dtype)
+    else:
+        dtype_label = kv_cache_dtype
+
+    dtype_label = str(dtype_label).lower()
+    if "fp8" in dtype_label:
+        return 1
+    if "float16" in dtype_label or "fp16" in dtype_label or "bfloat16" in dtype_label or "bf16" in dtype_label:
+        return 2
+    if "float32" in dtype_label or "fp32" in dtype_label:
+        return 4
+    return 2
+
+
+def _estimate_kv_cache_mb(
+    bundle: LoadedModelBundle,
+    runtime_mode: RuntimeMode,
+    prompts: List[str],
+    output_tokens_generated: Optional[int],
+) -> Optional[float]:
+    """
+    Estimate KV-cache footprint using a simple transformer-architecture proxy.
+    """
+    if bundle.tokenizer is None or bundle.hf_model_config is None:
+        return None
+    if output_tokens_generated is None:
+        return None
+
+    cfg = bundle.hf_model_config
+    num_hidden_layers = getattr(cfg, "num_hidden_layers", None)
+    num_attention_heads = getattr(cfg, "num_attention_heads", None)
+    num_key_value_heads = getattr(cfg, "num_key_value_heads", num_attention_heads)
+    hidden_size = getattr(cfg, "hidden_size", None)
+    head_dim = getattr(cfg, "head_dim", None)
+
+    if num_hidden_layers is None or num_key_value_heads is None:
+        return None
+    if head_dim is None:
+        if hidden_size is None or num_attention_heads in (None, 0):
+            return None
+        head_dim = hidden_size // num_attention_heads
+
+    try:
+        prompt_token_total = 0
+        for prompt in prompts:
+            prompt_token_total += len(bundle.tokenizer.encode(prompt, add_special_tokens=False))
+    except Exception:
+        return None
+
+    total_cached_tokens = prompt_token_total + output_tokens_generated
+    bytes_per_element = _estimate_bytes_per_element_from_runtime_mode(runtime_mode)
+
+    kv_bytes = (
+        2
+        * num_hidden_layers
+        * total_cached_tokens
+        * num_key_value_heads
+        * head_dim
+        * bytes_per_element
+    )
+    return kv_bytes / (1024 ** 2)
+
+
+def _monitor_runtime_stats(stop_event: Event, stats: dict) -> None:
+    """
+    Poll process RAM during the timed section.
+    """
+    process_ram_peak_mb = None
+
+    try:
+        while not stop_event.is_set():
+            if CONFIG.system.collect_cpu_memory_stats:
+                current_ram_mb = get_process_ram_mb()
+                if current_ram_mb is not None:
+                    if process_ram_peak_mb is None or current_ram_mb > process_ram_peak_mb:
+                        process_ram_peak_mb = current_ram_mb
+
+            stop_event.wait(CONFIG.system.power_poll_interval_s)
+    finally:
+        stats["cpu_ram_peak_mb"] = process_ram_peak_mb
+
+def _run_asyncio_coroutine_in_thread(coro):
+    """
+    Run an async coroutine in a dedicated worker thread.
+
+    This avoids notebook / IPython event-loop conflicts with asyncio.run().
+    """
+    result_box = {}
+    error_box = {}
+
+    def _target():
+        try:
+            result_box["value"] = asyncio.run(coro)
+        except Exception as exc:
+            error_box["error"] = exc
+
+    worker = Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join()
+
+    if "error" in error_box:
+        raise error_box["error"]
+
+    return result_box["value"]
+
+
+def _build_vllm_sampling_params(max_new_tokens: int):
+    """
+    Build vLLM sampling params for a streamed benchmark request.
+    """
+    from vllm import SamplingParams
+
+    sampling_kwargs = {
+        "max_tokens": max_new_tokens,
+        "temperature": CONFIG.generation.temperature if CONFIG.generation.do_sample else 0.0,
+        "top_p": CONFIG.generation.top_p,
+        "repetition_penalty": CONFIG.generation.repetition_penalty,
+    }
+
+    if CONFIG.generation.top_k > 0:
+        sampling_kwargs["top_k"] = CONFIG.generation.top_k
+    if CONFIG.generation.stop_sequences:
+        sampling_kwargs["stop"] = CONFIG.generation.stop_sequences
+
+    # DELTA mode is ideal because each streamed update contains only the newly
+    # generated text/token ids. If unavailable in the installed vLLM version,
+    # we gracefully fall back and handle cumulative outputs in the stream parser.
+    try:
+        from vllm.sampling_params import RequestOutputKind
+        sampling_kwargs["output_kind"] = RequestOutputKind.DELTA
+    except Exception:
+        pass
+
+    return SamplingParams(**sampling_kwargs)
+
+
+async def _stream_single_vllm_request(
+    engine,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int,
+):
+    """
+    Stream one vLLM request and capture real client-observed timing.
+
+    Returns:
+        output_text, first_token_time_s, stream_event_timestamps_s, end_time_s, output_token_count
+    """
+    sampling_params = _build_vllm_sampling_params(max_new_tokens=max_new_tokens)
+    request_id = f"benchmark-{uuid.uuid4().hex}"
+    request_start_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
+
+    accumulated_text = ""
+    accumulated_token_ids: List[int] = []
+    accumulated_token_count = 0
+    token_timestamps_s: List[float] = []
+    first_token_time_s = None
+    end_time_s = None
+
+    async for output in engine.generate(
+        prompt=prompt,
+        sampling_params=sampling_params,
+        request_id=request_id,
+    ):
+        for completion in output.outputs:
+            raw_text = completion.text or ""
+            raw_token_ids = list(getattr(completion, "token_ids", []) or [])
+
+            # Distinguish cumulative-vs-delta style text updates.
+            is_cumulative_text = bool(accumulated_text) and raw_text.startswith(accumulated_text)
+
+            # Robust handling across DELTA mode and older cumulative-stream behavior.
+            if is_cumulative_text:
+                new_text = raw_text[len(accumulated_text):]
+            else:
+                new_text = raw_text
+
+            # Distinguish cumulative-vs-delta token-id updates.
+            if is_cumulative_text and len(raw_token_ids) >= accumulated_token_count:
+                new_token_ids = raw_token_ids[accumulated_token_count:]
+            else:
+                new_token_ids = raw_token_ids
+
+            new_token_count = len(new_token_ids)
+
+            if new_text or new_token_count > 0:
+                current_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
+                if first_token_time_s is None:
+                    first_token_time_s = current_time_s
+
+                # Record one arrival timestamp per streamed update, not one
+                # repeated timestamp per token. Repeating the same timestamp for
+                # every token in a multi-token chunk creates artificial zero-gap
+                # TBT values and understates decode latency dynamics.
+                token_timestamps_s.append(current_time_s)
+
+            if new_text:
+                accumulated_text += new_text
+
+            if new_token_count > 0:
+                accumulated_token_ids.extend(new_token_ids)
+                accumulated_token_count += new_token_count
+
+        if output.finished:
+            end_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
+            break
+
+    if end_time_s is None:
+        end_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
+    if first_token_time_s is None:
+        first_token_time_s = end_time_s
+
+    reporting_token_ids = _filter_reporting_token_ids(tokenizer, accumulated_token_ids)
+    decoded_text = (
+        tokenizer.decode(reporting_token_ids, skip_special_tokens=True)
+        if tokenizer is not None and len(reporting_token_ids) > 0
+        else accumulated_text
+    )
+
+    return (
+        _sanitize_output_text(decoded_text),
+        first_token_time_s,
+        token_timestamps_s,
+        end_time_s,
+        len(reporting_token_ids) if len(reporting_token_ids) > 0 else None,
+        request_start_time_s,
+    )
+
+
+async def _stream_many_vllm_requests(
+    engine,
+    tokenizer,
+    prompts: List[str],
+    max_new_tokens: int,
+):
+    """
+    Stream one or more vLLM requests concurrently on the same engine.
+
+    This is important for the "continuous batching" benchmark: concurrent
+    requests on one async engine allow the scheduler to batch work naturally.
+    """
+    tasks = [
+        asyncio.create_task(
+            _stream_single_vllm_request(
+                engine=engine,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+            )
+        )
+        for prompt in prompts
+    ]
+
+    results = await asyncio.gather(*tasks)
+
+    output_texts = [item[0] for item in results]
+    first_token_candidates = [item[1] for item in results if item[1] is not None]
+    token_timestamps_s = sorted(
+        ts for item in results for ts in item[2]
+    )
+    end_time_s = max(item[3] for item in results)
+    token_counts = [item[4] for item in results]
+    output_token_count = (
+        sum(token_count for token_count in token_counts if token_count is not None)
+        if all(token_count is not None for token_count in token_counts)
+        else None
+    )
+
+    per_request_stats = []
+    for item in results:
+        request_first_token_time_s = item[1]
+        request_end_time_s = item[3]
+        request_output_tokens = item[4]
+        request_start_time_s = item[5]
+
+        request_ttft_ms = None
+        request_total_latency_ms = None
+        if request_first_token_time_s is not None:
+            request_ttft_ms = (request_first_token_time_s - request_start_time_s) * 1000.0
+        if request_end_time_s is not None:
+            request_total_latency_ms = (request_end_time_s - request_start_time_s) * 1000.0
+
+        per_request_stats.append({
+            "ttft_ms": request_ttft_ms,
+            "total_latency_ms": request_total_latency_ms,
+            "output_tokens_generated": request_output_tokens,
+        })
+
+    first_token_time_s = min(first_token_candidates) if first_token_candidates else end_time_s
+
+    return output_texts, first_token_time_s, token_timestamps_s, end_time_s, output_token_count, per_request_stats
+
 def _run_vllm_generate(
     bundle: LoadedModelBundle,
     workload: RuntimeWorkload,
@@ -110,15 +654,13 @@ def _run_vllm_generate(
     Run generation using the vLLM backend.
 
     Returns:
-        output_text, first_token_time_s, token_timestamps_s, end_time_s
+        output_texts, first_token_time_s, token_timestamps_s, end_time_s, output_token_count
 
     Notes:
-    - This first version uses a simple non-streaming path.
-    - Exact TTFT/TBT may need a streaming-compatible backend path later.
-    - For now, first_token_time_s is approximated conservatively.
+    - This path uses the async vLLM engine and real streamed outputs.
+    - TTFT is the first observed streamed delta arrival time.
+    - TBT is later derived from streamed decode timing and token count.
     """
-    from vllm import SamplingParams
-
     if prompts is None:
         prompts = [workload.prompt]
 
@@ -128,38 +670,14 @@ def _run_vllm_generate(
         else workload.max_new_tokens
     )
 
-    sampling_kwargs = {
-        "max_tokens": max_new_tokens,
-        "temperature": CONFIG.generation.temperature if CONFIG.generation.do_sample else 0.0,
-        "top_p": CONFIG.generation.top_p,
-        "repetition_penalty": CONFIG.generation.repetition_penalty,
-    }
-    if CONFIG.generation.top_k > 0:
-        sampling_kwargs["top_k"] = CONFIG.generation.top_k
-    if CONFIG.generation.stop_sequences:
-        sampling_kwargs["stop"] = CONFIG.generation.stop_sequences
-
-    sampling_params = SamplingParams(**sampling_kwargs)
-
-    outputs = bundle.model.generate(prompts, sampling_params=sampling_params)
-
-    end_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
-
-    output_texts: List[str] = []
-    for request_output in outputs:
-        text = ""
-        if request_output.outputs and len(request_output.outputs) > 0:
-            text = request_output.outputs[0].text
-        output_texts.append(_sanitize_output_text(text))
-
-    # Since this path is non-streaming, we do not have exact first-token timestamps yet.
-    # Keep TTFT/TBT as approximate placeholders only.
-    first_token_time_s = end_time_s
-
-    # No per-token timestamps yet in this basic implementation
-    token_timestamps_s = []
-
-    return output_texts, first_token_time_s, token_timestamps_s, end_time_s
+    return _run_asyncio_coroutine_in_thread(
+        _stream_many_vllm_requests(
+            engine=bundle.model,
+            tokenizer=bundle.tokenizer,
+            prompts=prompts,
+            max_new_tokens=max_new_tokens,
+        )
+    )
 
 def _run_transformers_generate(
     bundle: LoadedModelBundle,
@@ -267,7 +785,17 @@ def _run_transformers_generate(
     if first_token_time_s is None:
         first_token_time_s = end_time_s
 
-    return [output_text], first_token_time_s, token_timestamps_s, end_time_s
+    single_total_latency_ms = None
+    if end_time_s is not None:
+        single_total_latency_ms = (end_time_s - start_generation_time_s) * 1000.0
+
+    per_request_stats = [{
+        "ttft_ms": (first_token_time_s - start_generation_time_s) * 1000.0 if first_token_time_s is not None else None,
+        "total_latency_ms": single_total_latency_ms,
+        "output_tokens_generated": None,
+    }]
+
+    return [output_text], first_token_time_s, token_timestamps_s, end_time_s, None, per_request_stats
 
 def _run_generation(
     bundle: LoadedModelBundle,
@@ -331,15 +859,24 @@ def run_single_benchmark(
         repeated_prefix=workload.repeated_prefix,
         memory_pressure=workload.memory_pressure,
         num_requests_in_batch=1,
+        workload_cell=workload.workload_cell,
+        task_type=workload.task_type,
+        system_condition=workload.system_condition_name,
     )
 
     try:
+        _configure_quieter_runtime_logs()
+
         # Reset peak GPU memory tracking before the run
         reset_gpu_peak_memory_stats()
 
         # Load model/tokenizer for this mode
         if bundle is None:
             bundle = load_model_for_mode(runtime_mode)
+
+        result.gpu_allocated_before_mb = get_current_gpu_allocated_mb()
+        result.gpu_reserved_before_mb = get_reserved_gpu_memory_mb()
+        result.cpu_ram_before_mb = get_process_ram_mb()
 
         request_batch_size = int(runtime_mode.runner_kwargs.get("request_batch_size", 1))
 
@@ -386,27 +923,103 @@ def run_single_benchmark(
             )
 
         # Actual timed run
-        result.start_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
-
-        output_texts, first_token_time_s, token_timestamps_s, end_time_s = _run_generation(
-            bundle=bundle,
-            workload=workload,
-            prompts=timed_prompts,
+        memory_pressure_fraction = _resolve_memory_pressure_fraction(workload)
+        energy_poller = EnergyPoller(
+            poll_interval_s=CONFIG.system.power_poll_interval_s,
+            device_index=0,
         )
+        monitor_stop_event = Event()
+        monitor_stats = {}
+        monitor_thread = Thread(
+            target=_monitor_runtime_stats,
+            args=(monitor_stop_event, monitor_stats),
+            daemon=True,
+        )
+        monitor_thread.start()
+        pressure_stats = {}
+        try:
+            with MemoryPressureContext(
+                vram_fraction=memory_pressure_fraction,
+                device=CONFIG.model.device,
+            ) as pressure_ctx:
+                pressure_stats = pressure_ctx.get_stats()
+                with energy_poller:
+                    result.start_time_s = now_s(sync_cuda=CONFIG.system.sync_cuda_for_timing)
+                    (
+                        output_texts,
+                        first_token_time_s,
+                        token_timestamps_s,
+                        end_time_s,
+                        streamed_output_tokens,
+                        per_request_stats,
+                    ) = _run_generation(
+                        bundle=bundle,
+                        workload=workload,
+                        prompts=timed_prompts,
+                    )
+        finally:
+            monitor_stop_event.set()
+            monitor_thread.join()
 
         result.first_token_time_s = first_token_time_s
         result.end_time_s = end_time_s
         result.token_timestamps_s = token_timestamps_s
         result.output_text = "\n\n===== REQUEST SPLIT =====\n\n".join(output_texts)
-        result.output_tokens_generated = _count_output_tokens_for_texts(
+        tokenized_output_tokens = _count_output_tokens_for_texts(
             bundle.tokenizer,
             output_texts,
         )
 
+        # The vLLM streaming path decodes from filtered streamed token ids,
+        # so streamed_output_tokens should already line up with the final text.
+        # Keep a safe fallback anyway.
+        result.output_tokens_generated = (
+            streamed_output_tokens
+            if streamed_output_tokens is not None
+            else tokenized_output_tokens
+        )
+
+        result.per_request_ttft_ms = [
+            value["ttft_ms"] for value in per_request_stats if value.get("ttft_ms") is not None
+        ]
+        result.per_request_total_latency_ms = [
+            value["total_latency_ms"] for value in per_request_stats if value.get("total_latency_ms") is not None
+        ]
+        result.per_request_output_tokens_generated = [
+            value["output_tokens_generated"] for value in per_request_stats if value.get("output_tokens_generated") is not None
+        ]
+
+        result.avg_power_w = energy_poller.get_mean_power_watts()
+        result.cpu_ram_peak_mb = monitor_stats.get("cpu_ram_peak_mb")
+        result.cpu_ram_after_mb = get_process_ram_mb()
+        result.gpu_allocated_after_mb = get_current_gpu_allocated_mb()
+        result.gpu_reserved_after_mb = get_reserved_gpu_memory_mb()
+        result.kv_cache_estimate_mb = _estimate_kv_cache_mb(
+            bundle=bundle,
+            runtime_mode=runtime_mode,
+            prompts=timed_prompts,
+            output_tokens_generated=result.output_tokens_generated,
+        )
+
+        expected_reference = None
+        if workload.repeated_prefix and workload.followup_prompt is not None:
+            expected_reference = workload.followup_reference_answer
+        else:
+            expected_reference = workload.reference_answer
+
+        if CONFIG.system.collect_quality_metrics and expected_reference:
+            result.reference_exact_match = compute_exact_match(result.output_text, expected_reference)
+            result.reference_rouge_l_f1 = compute_rouge_l_f1(result.output_text, expected_reference)
+            result.reference_token_f1 = compute_token_f1(result.output_text, expected_reference)
+
+        measured_energy_j = energy_poller.get_total_energy_joules()
+        if measured_energy_j is not None:
+            result.energy_joules = measured_energy_j
+
         if runtime_mode.backend == "vllm":
             result.notes += (
                 "Primary trusted metrics for this run: total latency, memory, output tokens, "
-                "and rough throughput. TTFT/TBT are approximate in the current offline vLLM path. "
+                "rough throughput, and real streamed TTFT/TBT from the async vLLM engine. "
             )
         elif runtime_mode.backend == "transformers":
             result.notes += (
@@ -416,14 +1029,29 @@ def run_single_benchmark(
 
         if runtime_mode.continuous_batching:
             result.notes += (
-                f"Measured a {len(timed_prompts)}-request batched generate() call on one vLLM engine instance. "
+                f"Measured {len(timed_prompts)} concurrent requests on one async vLLM engine instance. "
             )
+
+        if memory_pressure_fraction > 0.0:
+            result.notes += (
+                f"Artificial VRAM pressure applied before timed run "
+                f"(target_fraction={memory_pressure_fraction:.2f}). "
+            )
+            if pressure_stats:
+                target_gb = pressure_stats.get("target_allocation_gb")
+                actual_gb = pressure_stats.get("actual_allocated_gb")
+                if target_gb is not None or actual_gb is not None:
+                    result.notes += (
+                        f"pressure_target_gb={target_gb}; pressure_actual_gb={actual_gb}. "
+                    )
 
         # Finalize derived metrics
         result = finalize_benchmark_result(result)
 
     except Exception as exc:
         result.error = str(exc)
+        result.error_type = type(exc).__name__
+        result.success = False
         result.notes = "Benchmark run failed."
 
     finally:
