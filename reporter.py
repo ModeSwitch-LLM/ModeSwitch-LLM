@@ -873,12 +873,6 @@ def generate_markdown_report(
     add_line("# ModeSwitch-LLM Benchmark Report")
     add_line("")
     add_line(f"**Run ID:** `{run_id}`")
-    add_line("")
-    add_line("This report is generated from the current project schema and preserves the core")
-    add_line("analysis structure proposed in Ali Alshehhi's reporting module: grouped")
-    add_line("aggregation, delta-vs-baseline comparison, phase-dominance analysis, Pareto")
-    add_line("reasoning, and automated textual observations.")
-    add_line("")
     add_line("---")
     add_line("")
 
