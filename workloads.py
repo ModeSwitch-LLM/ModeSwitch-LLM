@@ -14,10 +14,19 @@ workloads.py = how those workload buckets become actual benchmark inputs
 """
 
 from enum import Enum
+import csv
+import json
+import re
+from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
-from config import CONFIG, WorkloadConfig, get_workload_by_name
+from config import (
+    CONFIG,
+    BENCHMARK_DATA_DIR,
+    WorkloadConfig,
+    get_workload_by_name,
+)
 
 # =============================================================================
 # System-condition metadata
@@ -117,6 +126,13 @@ class RuntimeWorkload:
     # Optional reference answer for the follow-up prompt when repeated-prefix
     # timing uses the follow-up prompt rather than the initial one.
     followup_reference_answer: Optional[str] = None
+
+    # Optional benchmark-evaluation metadata
+    benchmark_suite: Optional[str] = None
+    benchmark_subset: Optional[str] = None
+    benchmark_language: Optional[str] = None
+    evaluation_mode: Optional[str] = None
+    benchmark_example_id: Optional[str] = None
 
     # Workload metadata borrowed from the broader benchmark design.
     task_type: Optional[str] = None
@@ -258,6 +274,178 @@ def _build_repeated_prefix_prompt(prompt_tokens: int, variant_id: int = 0) -> st
 
     return _expand_text_to_target_length(base_text, prompt_tokens)
 
+def _first_present_value(row: Dict[str, Any], keys: List[str]):
+    """
+    Return the first non-empty value from a row across candidate keys.
+    """
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _build_prompt_from_sidecar_row(row: Dict[str, Any]) -> Optional[str]:
+    """
+    Build a prompt from a benchmark sidecar row.
+
+    Supported shapes:
+    - {"prompt": "..."}
+    - {"input": "..."}
+    - {"question": "...", "choices": [...]}
+    - {"question": "...", "options": {...}}
+    """
+    direct_prompt = _first_present_value(
+        row,
+        ["prompt", "input", "full_prompt", "question_prompt", "user_prompt"],
+    )
+    if direct_prompt is not None:
+        return _append_benchmark_answer_instruction(str(direct_prompt), row)
+
+    question = _first_present_value(
+        row,
+        ["question", "query", "problem", "instruction"],
+    )
+    if question is None:
+        return None
+
+    choices = row.get("choices")
+    if choices is None:
+        choices = row.get("options")
+
+    choice_lines: List[str] = []
+    if isinstance(choices, dict):
+        for label, text in choices.items():
+            choice_lines.append(f"{label}. {text}")
+    elif isinstance(choices, list):
+        for idx, item in enumerate(choices):
+            default_label = chr(ord("A") + idx)
+            if isinstance(item, dict):
+                label = str(item.get("label", default_label))
+                text = item.get("text")
+                if text is None:
+                    text = item.get("option")
+                if text is None:
+                    text = item.get("value")
+            else:
+                label = default_label
+                text = item
+            choice_lines.append(f"{label}. {text}")
+
+    if choice_lines:
+        prompt = (
+            f"{question}\n\n"
+            f"Options:\n" + "\n".join(choice_lines)
+        )
+
+        return _append_benchmark_answer_instruction(prompt, row)
+
+    return _append_benchmark_answer_instruction(str(question), row)
+
+
+def _extract_reference_from_sidecar_row(row: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract the reference / gold answer from a benchmark sidecar row.
+    """
+    reference = _first_present_value(
+        row,
+        [
+            "reference",
+            "answer",
+            "target",
+            "label",
+            "gold",
+            "gold_answer",
+            "correct_answer",
+            "correct_option",
+            "expected_answer",
+        ],
+    )
+    if reference is None:
+        return None
+    return str(reference)
+
+
+def _infer_valid_labels_from_sidecar_row(row: Dict[str, Any]) -> Optional[List[str]]:
+    """
+    Infer valid multiple-choice labels from a sidecar row when possible.
+    """
+    explicit = row.get("valid_labels")
+    if explicit:
+        if isinstance(explicit, list):
+            return [str(x) for x in explicit]
+        return [str(explicit)]
+
+    choices = row.get("choices")
+    if choices is None:
+        choices = row.get("options")
+
+    if isinstance(choices, dict):
+        return [str(key) for key in choices.keys()]
+
+    if isinstance(choices, list) and choices:
+        labels = []
+        for idx, item in enumerate(choices):
+            default_label = chr(ord("A") + idx)
+            if isinstance(item, dict) and item.get("label") not in (None, ""):
+                labels.append(str(item["label"]))
+            else:
+                labels.append(default_label)
+        return labels
+
+    return None
+
+
+def _append_benchmark_answer_instruction(prompt: str, row: Dict[str, Any]) -> str:
+    """
+    Add stricter output-format instructions for benchmark grading.
+
+    This reduces parser ambiguity for multiple-choice and final-answer tasks.
+    """
+    prompt = str(prompt).rstrip()
+    lowered_prompt = prompt.lower()
+    evaluation_mode = str(row.get("evaluation_mode") or "").strip().lower()
+
+    if evaluation_mode in {"multiple_choice", "multiple_choice_accuracy"}:
+        if "entire response must be exactly one uppercase letter" in lowered_prompt:
+            return prompt
+
+        prompt = re.sub(
+            r"\n?\s*Answer with the correct letter only\.?\s*$",
+            "",
+            prompt,
+            flags=re.IGNORECASE,
+        ).rstrip()
+
+        valid_labels = _infer_valid_labels_from_sidecar_row(row)
+        if valid_labels:
+            label_text = ", ".join(str(label) for label in valid_labels)
+            return (
+                prompt
+                + f"\n\nReturn exactly one uppercase option label from {{{label_text}}} on a single line.\n"
+                  "Do not repeat the question.\n"
+                  "Do not repeat the options.\n"
+                  "Do not explain your answer.\n"
+                  "Your entire response must be exactly one uppercase letter."
+            )
+
+        return prompt + "\n\nRespond with exactly one option label. Do not explain your answer."
+
+    if evaluation_mode == "final_answer_exact_match":
+        if "final answer:" in lowered_prompt and "do not include units" in lowered_prompt:
+            return prompt
+
+        return (
+            prompt
+            + "\n\nSolve the problem carefully.\n"
+              "Your last line must be exactly:\n"
+              "Final answer: <number>\n"
+              "Do not include units, commas, or any text after that final line."
+        )
+
+    return prompt
+
+
 def _build_standard_reference_answer(prompt_tokens: int) -> str:
     """
     Reference answer for the standard prompt families.
@@ -329,6 +517,138 @@ def _build_memory_pressure_prompt(prompt_tokens: int) -> str:
     )
     return _expand_text_to_target_length(base_text, prompt_tokens)
 
+def _resolve_benchmark_sidecar_path(path_str: str) -> Path:
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    return BENCHMARK_DATA_DIR / path
+
+
+def _load_benchmark_sidecar_rows(path: Path) -> List[dict]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Benchmark sidecar file not found: {path}. "
+            "Create it before expanding benchmark workloads."
+        )
+
+    suffix = path.suffix.lower()
+
+    if suffix == ".jsonl":
+        rows = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+
+    if suffix == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f"Expected a list of dicts in JSON sidecar: {path}")
+        return data
+
+    if suffix == ".csv":
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            return list(csv.DictReader(f))
+
+    raise ValueError(
+        f"Unsupported benchmark sidecar type: {path.suffix}. "
+        "Use JSONL, JSON, or CSV."
+    )
+
+
+def _build_runtime_workloads_from_benchmark_sidecar(
+    workload: WorkloadConfig,
+    system_condition_name: Optional[str] = None,
+) -> List[RuntimeWorkload]:
+    if not workload.benchmark_source_path:
+        return []
+
+    resolved_system_condition_name = system_condition_name or workload.system_condition or "baseline"
+    sidecar_path = _resolve_benchmark_sidecar_path(workload.benchmark_source_path)
+    sidecar_rows = _load_benchmark_sidecar_rows(sidecar_path)
+
+    runtime_rows: List[RuntimeWorkload] = []
+    for idx, row in enumerate(sidecar_rows):
+        if not isinstance(row, dict):
+            continue
+
+        row_for_prompt = dict(workload.metadata)
+        row_for_prompt.update(row)
+
+        prompt = _build_prompt_from_sidecar_row(row_for_prompt)
+        if not prompt:
+            raise ValueError(
+                f"Benchmark sidecar row {idx} in {sidecar_path} is missing a usable prompt field."
+            )
+
+        example_id = str(
+            row.get("id")
+            or row.get("benchmark_example_id")
+            or f"{workload.name}_{idx:04d}"
+        )
+        runtime_name = f"{workload.name}__{example_id}"
+
+        row_metadata = dict(row.get("metadata") or {})
+        metadata = dict(workload.metadata)
+        metadata.update(row_metadata)
+
+        inferred_valid_labels = _infer_valid_labels_from_sidecar_row(row_for_prompt)
+        if inferred_valid_labels is not None and metadata.get("valid_labels") is None:
+            metadata["valid_labels"] = inferred_valid_labels
+
+        for passthrough_key in [
+            "valid_labels",
+            "question_id",
+            "judge_prompt",
+            "judge_reference",
+            "benchmark_primary_metric_name",
+            "benchmark_primary_metric_value",
+            "mmlu_pro_accuracy",
+            "gsm8k_exact_match_accuracy",
+            "truthfulqa_accuracy",
+            "gpqa_accuracy",
+            "mlu_accuracy",
+            "tam_accuracy",
+            "mt_bench_score",
+            "alpacaeval2_lc_win_rate",
+        ]:
+            if row.get(passthrough_key) is not None and passthrough_key not in metadata:
+                metadata[passthrough_key] = row.get(passthrough_key)
+
+        prompt_tokens_target = int(row.get("prompt_tokens_target", workload.prompt_tokens))
+        max_new_tokens = int(row.get("max_new_tokens", workload.max_new_tokens))
+
+        runtime_rows.append(
+            RuntimeWorkload(
+                name=runtime_name,
+                prompt=str(prompt),
+                max_new_tokens=max_new_tokens,
+                followup_prompt=None,
+                reference_answer=_extract_reference_from_sidecar_row(row),
+                followup_reference_answer=None,
+                benchmark_suite=row.get("benchmark_suite") or workload.benchmark_suite,
+                benchmark_subset=row.get("benchmark_subset") or workload.benchmark_subset,
+                benchmark_language=row.get("benchmark_language") or workload.benchmark_language,
+                evaluation_mode=row.get("evaluation_mode") or workload.evaluation_mode,
+                benchmark_example_id=example_id,
+                task_type=workload.task_type,
+                workload_cell=row.get("workload_cell") or workload.workload_cell or infer_workload_cell(
+                    prompt_tokens_target,
+                    max_new_tokens,
+                ),
+                system_condition_name=resolved_system_condition_name,
+                description=row.get("description") or workload.description,
+                prompt_tokens_target=prompt_tokens_target,
+                repeated_prefix=False,
+                memory_pressure=workload.memory_pressure,
+                metadata=metadata,
+            )
+        )
+
+    return runtime_rows
 
 # =============================================================================
 # Workload builders
@@ -347,6 +667,19 @@ def build_runtime_workload(
     reference_answer = None
     followup_reference_answer = None
     resolved_system_condition_name = system_condition_name or workload.system_condition or "baseline"
+
+    if workload.benchmark_source_path:
+        expanded = _build_runtime_workloads_from_benchmark_sidecar(
+            workload,
+            system_condition_name=system_condition_name,
+        )
+        if len(expanded) != 1:
+            raise ValueError(
+                f"Workload '{workload.name}' expands to {len(expanded)} benchmark examples. "
+                "Use build_runtime_workloads_for_name(...) or an expanded runtime name "
+                "like '<workload_name>__<example_id>'."
+            )
+        return expanded[0]
 
     if workload.repeated_prefix:
         runtime_name = f"{workload.name}_v{repeated_prefix_variant}"
@@ -377,6 +710,14 @@ def build_runtime_workload(
         reference_answer = workload.reference_output
 
     metadata = dict(workload.metadata)
+    if workload.benchmark_suite is not None:
+        metadata.setdefault("benchmark_suite", workload.benchmark_suite)
+    if workload.benchmark_subset is not None:
+        metadata.setdefault("benchmark_subset", workload.benchmark_subset)
+    if workload.benchmark_language is not None:
+        metadata.setdefault("benchmark_language", workload.benchmark_language)
+    if workload.evaluation_mode is not None:
+        metadata.setdefault("evaluation_mode", workload.evaluation_mode)
     metadata["base_workload_name"] = workload.name
     metadata["prompt_tokens_target"] = workload.prompt_tokens
     metadata["max_new_tokens"] = workload.max_new_tokens
@@ -397,6 +738,11 @@ def build_runtime_workload(
         followup_prompt=followup_prompt,
         reference_answer=reference_answer,
         followup_reference_answer=followup_reference_answer,
+        benchmark_suite=workload.benchmark_suite or metadata.get("benchmark_suite"),
+        benchmark_subset=workload.benchmark_subset or metadata.get("benchmark_subset"),
+        benchmark_language=workload.benchmark_language or metadata.get("benchmark_language"),
+        evaluation_mode=workload.evaluation_mode or metadata.get("evaluation_mode"),
+        benchmark_example_id=metadata.get("benchmark_example_id"),
         task_type=workload.task_type,
         workload_cell=workload.workload_cell or infer_workload_cell(
             workload.prompt_tokens,
@@ -411,6 +757,38 @@ def build_runtime_workload(
         metadata=metadata,
     )
 
+def build_runtime_workloads_for_name(
+    workload_name: str,
+    repeated_prefix_variants: int = 2,
+    system_condition_name: Optional[str] = None,
+) -> List[RuntimeWorkload]:
+    workload = get_workload_by_name(workload_name)
+
+    if workload.benchmark_source_path:
+        return _build_runtime_workloads_from_benchmark_sidecar(
+            workload,
+            system_condition_name=system_condition_name,
+        )
+
+    if workload.repeated_prefix:
+        return [
+            build_runtime_workload(
+                workload=workload,
+                repeated_prefix_variant=variant_id,
+                system_condition_name=system_condition_name,
+            )
+            for variant_id in range(repeated_prefix_variants)
+        ]
+
+    return [
+        build_runtime_workload(
+            workload=workload,
+            repeated_prefix_variant=0,
+            system_condition_name=system_condition_name,
+        )
+    ]
+
+
 
 def build_runtime_workload_by_name(
     workload_name: str,
@@ -420,6 +798,22 @@ def build_runtime_workload_by_name(
     """
     Fetch a workload config by name and build its runtime form.
     """
+    if "__" in workload_name:
+        base_name, _, example_id = workload_name.partition("__")
+        workload = get_workload_by_name(base_name)
+        if workload.benchmark_source_path:
+            expanded = _build_runtime_workloads_from_benchmark_sidecar(
+                workload,
+                system_condition_name=system_condition_name,
+            )
+            for runtime_workload in expanded:
+                if runtime_workload.name == workload_name:
+                    return runtime_workload
+            raise ValueError(
+                f"Unknown benchmark runtime workload name: {workload_name}. "
+                f"No example with id '{example_id}' was found in '{base_name}'."
+            )
+
     workload = get_workload_by_name(workload_name)
     return build_runtime_workload(
         workload=workload,
@@ -440,7 +834,11 @@ def get_all_runtime_workloads(
     runtime_workloads: List[RuntimeWorkload] = []
 
     for workload in CONFIG.workloads:
-        if workload.repeated_prefix:
+        if workload.benchmark_source_path:
+            runtime_workloads.extend(
+                _build_runtime_workloads_from_benchmark_sidecar(workload)
+            )
+        elif workload.repeated_prefix:
             for variant_id in range(repeated_prefix_variants):
                 runtime_workloads.append(
                     build_runtime_workload(
@@ -474,7 +872,10 @@ def summarize_workload(runtime_workload: RuntimeWorkload) -> str:
         summary += " | repeated_prefix=True"
     if runtime_workload.memory_pressure:
         summary += " | memory_pressure=True"
-
+    if runtime_workload.benchmark_suite:
+        summary += f" | benchmark_suite={runtime_workload.benchmark_suite}"
+    if runtime_workload.benchmark_example_id:
+        summary += f" | benchmark_example_id={runtime_workload.benchmark_example_id}"
     return summary
 
 

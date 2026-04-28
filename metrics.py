@@ -15,11 +15,12 @@ metrics.py should focus on measurement + metric calculation
 """
 
 from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 import time
 import math
 import os
 import re
+from decimal import Decimal, InvalidOperation
 from collections import Counter
 
 try:
@@ -121,6 +122,25 @@ class BenchmarkResult:
     reference_token_f1: Optional[float] = None
     baseline_similarity_rouge_l_f1: Optional[float] = None
     quality_degradation_vs_baseline: Optional[float] = None
+
+    # Benchmark-evaluation metadata
+    benchmark_suite: Optional[str] = None
+    benchmark_subset: Optional[str] = None
+    benchmark_language: Optional[str] = None
+    evaluation_mode: Optional[str] = None
+    benchmark_example_id: Optional[str] = None
+    benchmark_primary_metric_name: Optional[str] = None
+    benchmark_primary_metric_value: Optional[float] = None
+
+    # Benchmark accuracy / quality metrics
+    mmlu_pro_accuracy: Optional[float] = None
+    gsm8k_exact_match_accuracy: Optional[float] = None
+    truthfulqa_accuracy: Optional[float] = None
+    gpqa_accuracy: Optional[float] = None
+    mlu_accuracy: Optional[float] = None
+    tam_accuracy: Optional[float] = None
+    mt_bench_score: Optional[float] = None
+    alpacaeval2_lc_win_rate: Optional[float] = None
 
     # Free-form notes / errors
     notes: str = ""
@@ -433,6 +453,25 @@ def _normalize_text(text: Optional[str]) -> str:
     text = re.sub(r"\s+", " ", text)
     return text
 
+def _safe_float(value: Any) -> Optional[float]:
+    """
+    Best-effort float conversion.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bool_to_accuracy(value: Optional[bool]) -> Optional[float]:
+    """
+    Convert a correctness boolean into a 0/1 accuracy value.
+    """
+    if value is None:
+        return None
+    return 1.0 if value else 0.0
 
 def _tokenize_for_quality(text: Optional[str]) -> List[str]:
     """
@@ -441,6 +480,119 @@ def _tokenize_for_quality(text: Optional[str]) -> List[str]:
     normalized = _normalize_text(text)
     return re.findall(r"\w+|[^\w\s]", normalized)
 
+def _normalize_suite_name(benchmark_suite: Optional[str]) -> str:
+    """
+    Normalize benchmark-suite naming across dashes / spaces / casing.
+    """
+    if benchmark_suite is None:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", benchmark_suite.strip().lower()).strip("_")
+
+
+def _extract_choice_label(
+    text: Optional[str],
+    valid_labels: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """
+    Extract a multiple-choice label such as A/B/C/D from a prediction/reference.
+    """
+    if text is None:
+        return None
+
+    labels = [str(x).strip().upper() for x in (valid_labels or list("ABCDEFGHIJ"))]
+    labels = [label for label in labels if label]
+    if not labels:
+        return None
+
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    raw_text = str(text).strip()
+    upper_text = raw_text.upper()
+
+    exact_candidate = raw_text.strip().strip("()[]{}.:;- ").upper()
+    if exact_candidate in labels:
+        return exact_candidate
+
+    marker_patterns = [
+        rf"(?:FINAL\s+ANSWER|FINAL|ANSWER|THE\s+ANSWER\s+IS|ANSWER\s+IS|OPTION|CHOICE|CORRECT\s+ANSWER)\s*[:\-]?\s*\(?\s*({label_pattern})\s*\)?",
+        rf"(?:I\s+CHOOSE|I\s+SELECT|I\s+PICK|MY\s+ANSWER\s+IS|THEREFORE|THUS|HENCE|SO)\s*[:\-]?\s*\(?\s*({label_pattern})\s*\)?",
+        rf"(?:الجواب|الإجابة|الإجابة\s+الصحيحة)\s*[:\-]?\s*\(?\s*({label_pattern})\s*\)?",
+        rf"(?:RESPUESTA|LA\s+RESPUESTA|RESPOSTA)\s*[:\-]?\s*\(?\s*({label_pattern})\s*\)?",
+     ]
+
+    matches = []
+    for pattern in marker_patterns:
+        matches.extend(list(re.finditer(pattern, upper_text)))
+
+    if matches:
+        return matches[-1].group(1).upper()
+
+    line_patterns = [
+        rf"^\(?\s*({label_pattern})\s*\)?\s*$",
+        rf"^\(?\s*({label_pattern})\s*\)?\s*[\.\):\-]\s*$",
+    ]
+
+    raw_lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    candidate_lines = raw_lines[:3] + raw_lines[-3:]
+    seen_lines = set()
+
+    for line in candidate_lines:
+        upper_line = line.upper()
+        if upper_line in seen_lines:
+            continue
+        seen_lines.add(upper_line)
+
+        for pattern in line_patterns:
+            match = re.search(pattern, upper_line)
+            if match:
+                return match.group(1).upper()
+    return None
+
+
+def _extract_last_numeric_answer(text: Optional[str]) -> Optional[str]:
+    """
+    Extract a numeric final answer.
+
+    Prefer explicit final-answer markers, then fall back to the last number.
+    """
+    if text is None:
+        return None
+
+    text = str(text)
+
+    marker_patterns = [
+        r"\\boxed\{\s*([-+]?\d[\d,]*(?:\.\d+)?)\s*\}",
+        r"####\s*([-+]?\d[\d,]*(?:\.\d+)?)",
+        r"final\s+answer\s*[:\-]?\s*([-+]?\d[\d,]*(?:\.\d+)?)",
+        r"answer\s*[:\-]?\s*([-+]?\d[\d,]*(?:\.\d+)?)",
+        r"the\s+answer\s+is\s*[:\-]?\s*([-+]?\d[\d,]*(?:\.\d+)?)",
+    ]
+
+    for pattern in marker_patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        if matches:
+            return matches[-1].replace(",", "").strip()
+
+    matches = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", text)
+    if not matches:
+        return None
+
+    return matches[-1].replace(",", "").strip()
+
+def _numeric_strings_equal(a: Optional[str], b: Optional[str]) -> bool:
+    """
+    Compare numeric strings robustly.
+
+    This treats answers like 109 and 109.0 as equal.
+    """
+    if a is None or b is None:
+        return False
+
+    try:
+        da = Decimal(str(a).replace(",", "").strip())
+        db = Decimal(str(b).replace(",", "").strip())
+        return da == db
+    except (InvalidOperation, ValueError):
+        return str(a).strip() == str(b).strip()
 
 def compute_exact_match(prediction: Optional[str], reference: Optional[str]) -> Optional[bool]:
     """
@@ -450,6 +602,44 @@ def compute_exact_match(prediction: Optional[str], reference: Optional[str]) -> 
         return None
     return _normalize_text(prediction) == _normalize_text(reference)
 
+def compute_multiple_choice_accuracy(
+    prediction: Optional[str],
+    reference: Optional[str],
+    valid_labels: Optional[Sequence[str]] = None,
+) -> Optional[float]:
+    """
+    Compute 0/1 multiple-choice accuracy.
+    """
+    if prediction is None or reference is None:
+        return None
+
+    pred_label = _extract_choice_label(prediction, valid_labels=valid_labels)
+    ref_label = _extract_choice_label(reference, valid_labels=valid_labels)
+
+    if pred_label is not None and ref_label is not None:
+        return 1.0 if pred_label == ref_label else 0.0
+
+    # Fallback to normalized exact match if labels are not extractable.
+    return _bool_to_accuracy(compute_exact_match(prediction, reference))
+
+
+def compute_final_answer_exact_match(
+    prediction: Optional[str],
+    reference: Optional[str],
+) -> Optional[float]:
+    """
+    Compute GSM8K-style final-answer exact match.
+    """
+    if prediction is None or reference is None:
+        return None
+
+    pred_num = _extract_last_numeric_answer(prediction)
+    ref_num = _extract_last_numeric_answer(reference)
+
+    if pred_num is not None and ref_num is not None:
+        return 1.0 if _numeric_strings_equal(pred_num, ref_num) else 0.0
+
+    return _bool_to_accuracy(compute_exact_match(prediction, reference))
 
 def compute_token_f1(prediction: Optional[str], reference: Optional[str]) -> Optional[float]:
     """
@@ -519,6 +709,160 @@ def compute_rouge_l_f1(prediction: Optional[str], reference: Optional[str]) -> O
     recall = lcs / len(ref_tokens)
     return 2 * precision * recall / (precision + recall)
 
+def compute_benchmark_suite_metrics(
+    prediction: Optional[str],
+    reference: Optional[str],
+    benchmark_suite: Optional[str] = None,
+    evaluation_mode: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Optional[float]]:
+    """
+    Compute benchmark-specific evaluation metrics.
+
+    Notes:
+    - MMLU-Pro / GPQA / many TruthfulQA / MLU setups are usually multiple-choice.
+    - GSM8K is usually final-answer exact match.
+    - TAM is left intentionally generic and uses the provided evaluation_mode.
+    - MT-Bench and AlpacaEval 2 LC typically require an external judge. This
+      function supports them by accepting precomputed values in metadata.
+    """
+    metadata = metadata or {}
+    suite = _normalize_suite_name(benchmark_suite)
+    mode = _normalize_suite_name(evaluation_mode)
+
+    results: Dict[str, Optional[float]] = {
+        "mmlu_pro_accuracy": None,
+        "gsm8k_exact_match_accuracy": None,
+        "truthfulqa_accuracy": None,
+        "gpqa_accuracy": None,
+        "mlu_accuracy": None,
+        "tam_accuracy": None,
+        "mt_bench_score": None,
+        "alpacaeval2_lc_win_rate": None,
+        "benchmark_primary_metric_value": None,
+    }
+
+    primary_metric_name: Optional[str] = None
+    primary_metric_name_override = metadata.get("benchmark_primary_metric_name")
+    primary_metric_value_override = _safe_float(metadata.get("benchmark_primary_metric_value"))
+
+    valid_labels = metadata.get("valid_labels")
+
+    if primary_metric_name_override and primary_metric_value_override is not None:
+        if primary_metric_name_override in results:
+            results[primary_metric_name_override] = primary_metric_value_override
+        results["benchmark_primary_metric_name"] = primary_metric_name_override
+        results["benchmark_primary_metric_value"] = primary_metric_value_override
+        return results
+
+    # Allow external scorers / sidecar evaluators to inject scores directly.
+    for field_name in (
+        "mmlu_pro_accuracy",
+        "gsm8k_exact_match_accuracy",
+        "truthfulqa_accuracy",
+        "gpqa_accuracy",
+        "mlu_accuracy",
+        "tam_accuracy",
+        "mt_bench_score",
+        "alpacaeval2_lc_win_rate",
+    ):
+        override = _safe_float(metadata.get(field_name))
+        if override is not None:
+            results[field_name] = override
+
+    if suite in {"mmlu_pro", "mmlu"} and results["mmlu_pro_accuracy"] is None and suite == "mmlu_pro":
+        results["mmlu_pro_accuracy"] = compute_multiple_choice_accuracy(
+            prediction,
+            reference,
+            valid_labels=valid_labels,
+        )
+        primary_metric_name = "mmlu_pro_accuracy"
+
+    if suite == "gsm8k" and results["gsm8k_exact_match_accuracy"] is None:
+        results["gsm8k_exact_match_accuracy"] = compute_final_answer_exact_match(
+            prediction,
+            reference,
+        )
+        primary_metric_name = "gsm8k_exact_match_accuracy"
+
+    if suite == "truthfulqa" and results["truthfulqa_accuracy"] is None:
+        if mode in {"multiple_choice", "multiple_choice_accuracy", ""}:
+            results["truthfulqa_accuracy"] = compute_multiple_choice_accuracy(
+                prediction,
+                reference,
+                valid_labels=valid_labels or ["A", "B"],
+            )
+        elif mode in {"exact_match", "binary_accuracy"}:
+            results["truthfulqa_accuracy"] = _bool_to_accuracy(
+                compute_exact_match(prediction, reference)
+            )
+        primary_metric_name = "truthfulqa_accuracy"
+
+    if suite == "gpqa" and results["gpqa_accuracy"] is None:
+        results["gpqa_accuracy"] = compute_multiple_choice_accuracy(
+            prediction,
+            reference,
+            valid_labels=valid_labels,
+        )
+        primary_metric_name = "gpqa_accuracy"
+
+    if suite == "mlu" and results["mlu_accuracy"] is None:
+        if mode in {"multiple_choice", "multiple_choice_accuracy", ""}:
+            results["mlu_accuracy"] = compute_multiple_choice_accuracy(
+                prediction,
+                reference,
+                valid_labels=valid_labels,
+            )
+        elif mode == "final_answer_exact_match":
+            results["mlu_accuracy"] = compute_final_answer_exact_match(prediction, reference)
+        else:
+            results["mlu_accuracy"] = _bool_to_accuracy(
+                compute_exact_match(prediction, reference)
+            )
+        primary_metric_name = "mlu_accuracy"
+
+    if suite == "tam" and results["tam_accuracy"] is None:
+        if mode == "multiple_choice_accuracy":
+            results["tam_accuracy"] = compute_multiple_choice_accuracy(
+                prediction,
+                reference,
+                valid_labels=valid_labels,
+            )
+        elif mode == "final_answer_exact_match":
+            results["tam_accuracy"] = compute_final_answer_exact_match(prediction, reference)
+        else:
+            results["tam_accuracy"] = _bool_to_accuracy(
+                compute_exact_match(prediction, reference)
+            )
+        primary_metric_name = "tam_accuracy"
+
+    if suite == "mt_bench" and results["mt_bench_score"] is not None:
+        primary_metric_name = "mt_bench_score"
+
+    if suite in {"alpacaeval_2_lc", "alpacaeval2_lc"} and results["alpacaeval2_lc_win_rate"] is not None:
+        primary_metric_name = "alpacaeval2_lc_win_rate"
+
+    # Backfill primary metric name if it arrived via metadata override.
+    if primary_metric_name is None:
+        for candidate in (
+            "mmlu_pro_accuracy",
+            "gsm8k_exact_match_accuracy",
+            "truthfulqa_accuracy",
+            "gpqa_accuracy",
+            "mlu_accuracy",
+            "tam_accuracy",
+            "mt_bench_score",
+            "alpacaeval2_lc_win_rate",
+        ):
+            if results[candidate] is not None:
+                primary_metric_name = candidate
+                break
+
+    results["benchmark_primary_metric_value"] = (
+        results.get(primary_metric_name) if primary_metric_name is not None else None
+    )
+    results["benchmark_primary_metric_name"] = primary_metric_name
+    return results
 
 # =============================================================================
 # Result finalization

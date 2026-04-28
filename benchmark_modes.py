@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 from config import (
     CONFIG,
@@ -39,6 +39,32 @@ from workloads import (
 from runner import run_single_benchmark
 from metrics import BenchmarkResult, compute_rouge_l_f1
 
+EXTERNAL_BENCHMARK_SCORE_FIELDS = {
+    "benchmark_primary_metric_value",
+    "mmlu_pro_accuracy",
+    "gsm8k_exact_match_accuracy",
+    "truthfulqa_accuracy",
+    "gpqa_accuracy",
+    "mlu_accuracy",
+    "tam_accuracy",
+    "mt_bench_score",
+    "alpacaeval2_lc_win_rate",
+}
+
+def _aggregate_workload_name(result: BenchmarkResult) -> str:
+    """
+    Group sidecar-expanded benchmark examples back to their parent workload.
+
+    Example:
+        mmlu_pro_eval__q0001 -> mmlu_pro_eval
+    """
+    if (
+        result.benchmark_example_id is not None
+        and isinstance(result.workload_name, str)
+        and "__" in result.workload_name
+    ):
+        return result.workload_name.split("__", 1)[0]
+    return result.workload_name
 
 # =============================================================================
 # Test plan helpers
@@ -167,6 +193,15 @@ def build_test_plan(
         "short_prompt_long_output",
         "long_prompt_short_output",
     ]
+    benchmark_workloads = [
+        "mmlu_pro_eval",
+        "gsm8k_eval",
+        "truthfulqa_eval",
+        "gpqa_eval",
+        "mlu_eval",
+        "mt_bench_eval",
+        "alpacaeval2_lc_eval",
+    ]
 
     if test_profile == "initial":
         baseline_workloads = [
@@ -236,6 +271,28 @@ def build_test_plan(
             "int8_plus_continuous_batching",
             workload_name,
         )
+
+    # Only include benchmark workloads in the largest profile so the default
+    # curated sweep does not explode in size unexpectedly.
+    if test_profile == "all":
+        benchmark_candidate_modes = [
+            "fp16_baseline",
+            "gptq_4bit",
+            "speculative_decoding",
+            "gptq_plus_prefix_caching",
+            "int8_plus_continuous_batching",
+            "prefix_caching",
+            "continuous_batching",
+        ]
+        for mode_name in benchmark_candidate_modes:
+            for workload_name in benchmark_workloads:
+                _add_test_case(
+                    cases,
+                    seen,
+                    available_mode_names,
+                    mode_name,
+                    workload_name,
+                )
 
     return cases
 
@@ -355,12 +412,20 @@ def save_summary_csv(results: List[BenchmarkResult], output_path: Path) -> None:
         rows.append({
             "mode_name": r.mode_name,
             "workload_name": r.workload_name,
+            "workload_group_name": _aggregate_workload_name(r),
+            "benchmark_example_id": r.benchmark_example_id,
             "workload_cell": r.workload_cell,
             "task_type": r.task_type,
             "system_condition": r.system_condition,
             "backend": r.backend,
             "trial_index": r.trial_index,
             "num_requests_in_batch": r.num_requests_in_batch,
+            "benchmark_suite": r.benchmark_suite,
+            "benchmark_subset": r.benchmark_subset,
+            "benchmark_language": r.benchmark_language,
+            "evaluation_mode": r.evaluation_mode,
+            "benchmark_primary_metric_name": r.benchmark_primary_metric_name,
+            "benchmark_primary_metric_value": r.benchmark_primary_metric_value,
             "success": r.success,
             "error_type": r.error_type,
             "total_latency_ms": r.total_latency_ms,
@@ -385,6 +450,14 @@ def save_summary_csv(results: List[BenchmarkResult], output_path: Path) -> None:
             "reference_token_f1": r.reference_token_f1,
             "baseline_similarity_rouge_l_f1": r.baseline_similarity_rouge_l_f1,
             "quality_degradation_vs_baseline": r.quality_degradation_vs_baseline,
+            "mmlu_pro_accuracy": r.mmlu_pro_accuracy,
+            "gsm8k_exact_match_accuracy": r.gsm8k_exact_match_accuracy,
+            "truthfulqa_accuracy": r.truthfulqa_accuracy,
+            "gpqa_accuracy": r.gpqa_accuracy,
+            "mlu_accuracy": r.mlu_accuracy,
+            "tam_accuracy": r.tam_accuracy,
+            "mt_bench_score": r.mt_bench_score,
+            "alpacaeval2_lc_win_rate": r.alpacaeval2_lc_win_rate,
             "error": r.error,
             "notes": r.notes,
         })
@@ -476,7 +549,12 @@ def build_aggregate_rows(results: List[BenchmarkResult]) -> List[dict]:
     """
     grouped = defaultdict(list)
     for result in results:
-        key = (result.mode_name, result.workload_name, result.system_condition, result.backend)
+        key = (
+            result.mode_name,
+            _aggregate_workload_name(result),
+            result.system_condition,
+            result.backend,
+        )
         grouped[key].append(result)
 
     rows = []
@@ -484,6 +562,10 @@ def build_aggregate_rows(results: List[BenchmarkResult]) -> List[dict]:
         successful = [result for result in group if result.error is None]
         failures = [result for result in group if result.error is not None]
         first = group[0]
+        benchmark_primary_metric_name = next(
+            (r.benchmark_primary_metric_name for r in successful if r.benchmark_primary_metric_name),
+            next((r.benchmark_primary_metric_name for r in group if r.benchmark_primary_metric_name), None),
+        )
 
         ttft_values = [result.ttft_ms for result in successful if result.ttft_ms is not None]
         latency_values = [result.total_latency_ms for result in successful if result.total_latency_ms is not None]
@@ -501,6 +583,11 @@ def build_aggregate_rows(results: List[BenchmarkResult]) -> List[dict]:
             "task_type": first.task_type,
             "system_condition": system_condition,
             "backend": backend,
+            "benchmark_suite": first.benchmark_suite,
+            "benchmark_subset": first.benchmark_subset,
+            "benchmark_language": first.benchmark_language,
+            "evaluation_mode": first.evaluation_mode,
+            "benchmark_primary_metric_name": benchmark_primary_metric_name,
             "num_runs": len(group),
             "completed_runs": len(successful),
             "failed_runs": len(failures),
@@ -509,6 +596,15 @@ def build_aggregate_rows(results: List[BenchmarkResult]) -> List[dict]:
             "reference_rouge_l_f1_mean": _mean([r.reference_rouge_l_f1 for r in successful if r.reference_rouge_l_f1 is not None]),
             "baseline_similarity_rouge_l_f1_mean": _mean([r.baseline_similarity_rouge_l_f1 for r in successful if r.baseline_similarity_rouge_l_f1 is not None]),
             "quality_degradation_vs_baseline_mean": _mean([r.quality_degradation_vs_baseline for r in successful if r.quality_degradation_vs_baseline is not None]),
+            "benchmark_primary_metric_value_mean": _mean([r.benchmark_primary_metric_value for r in successful if r.benchmark_primary_metric_value is not None]),
+            "mmlu_pro_accuracy_mean": _mean([r.mmlu_pro_accuracy for r in successful if r.mmlu_pro_accuracy is not None]),
+            "gsm8k_exact_match_accuracy_mean": _mean([r.gsm8k_exact_match_accuracy for r in successful if r.gsm8k_exact_match_accuracy is not None]),
+            "truthfulqa_accuracy_mean": _mean([r.truthfulqa_accuracy for r in successful if r.truthfulqa_accuracy is not None]),
+            "gpqa_accuracy_mean": _mean([r.gpqa_accuracy for r in successful if r.gpqa_accuracy is not None]),
+            "mlu_accuracy_mean": _mean([r.mlu_accuracy for r in successful if r.mlu_accuracy is not None]),
+            "tam_accuracy_mean": _mean([r.tam_accuracy for r in successful if r.tam_accuracy is not None]),
+            "mt_bench_score_mean": _mean([r.mt_bench_score for r in successful if r.mt_bench_score is not None]),
+            "alpacaeval2_lc_win_rate_mean": _mean([r.alpacaeval2_lc_win_rate for r in successful if r.alpacaeval2_lc_win_rate is not None]),
             "avg_power_w_mean": _mean([r.avg_power_w for r in successful if r.avg_power_w is not None]),
             "energy_joules_mean": _mean([r.energy_joules for r in successful if r.energy_joules is not None]),
             "energy_per_token_j_mean": _mean([r.energy_per_token_j for r in successful if r.energy_per_token_j is not None]),
@@ -572,6 +668,7 @@ def build_comparison_rows(results: List[BenchmarkResult]) -> List[dict]:
         comparison_row["throughput_ratio_vs_baseline"] = None
         comparison_row["energy_per_token_ratio_vs_baseline"] = None
         comparison_row["peak_gpu_memory_delta_vs_baseline_mb"] = None
+        comparison_row["benchmark_primary_metric_delta_vs_baseline"] = None
 
         baseline_latency = baseline.get("total_latency_ms_mean")
         row_latency = row.get("total_latency_ms_mean")
@@ -593,10 +690,88 @@ def build_comparison_rows(results: List[BenchmarkResult]) -> List[dict]:
         if baseline_mem is not None and row_mem is not None:
             comparison_row["peak_gpu_memory_delta_vs_baseline_mb"] = row_mem - baseline_mem
 
+        baseline_benchmark = baseline.get("benchmark_primary_metric_value_mean")
+        row_benchmark = row.get("benchmark_primary_metric_value_mean")
+        if baseline_benchmark is not None and row_benchmark is not None:
+            comparison_row["benchmark_primary_metric_delta_vs_baseline"] = row_benchmark - baseline_benchmark
+  
         comparison_rows.append(comparison_row)
 
     return comparison_rows
 
+
+def _load_sidecar_score_rows(sidecar_path: Path) -> List[dict]:
+    suffix = sidecar_path.suffix.lower()
+
+    if suffix == ".jsonl":
+        rows = []
+        with open(sidecar_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+
+    if suffix == ".json":
+        with open(sidecar_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f"Expected a list of dicts in sidecar JSON: {sidecar_path}")
+        return data
+
+    if suffix == ".csv":
+        with open(sidecar_path, "r", encoding="utf-8", newline="") as f:
+            return list(csv.DictReader(f))
+
+    raise ValueError(
+        f"Unsupported sidecar score file type: {sidecar_path.suffix}. "
+        "Use JSONL, JSON, or CSV."
+    )
+
+
+def apply_external_score_sidecar(
+    results: List[BenchmarkResult],
+    sidecar_path: Path,
+) -> int:
+    rows = _load_sidecar_score_rows(sidecar_path)
+
+    by_workload_key = {}
+    by_example_key = {}
+    for result in results:
+        by_workload_key[(result.mode_name, result.workload_name, result.trial_index)] = result
+        if result.benchmark_example_id is not None:
+            by_example_key[(result.mode_name, result.benchmark_example_id, result.trial_index)] = result
+
+    applied = 0
+    for row in rows:
+        mode_name = row.get("mode_name")
+        workload_name = row.get("workload_name")
+        benchmark_example_id = row.get("benchmark_example_id")
+        trial_index = row.get("trial_index")
+        trial_index = int(trial_index) if trial_index not in (None, "") else None
+
+        target = None
+        if mode_name is not None and workload_name is not None and trial_index is not None:
+            target = by_workload_key.get((mode_name, workload_name, trial_index))
+        if target is None and mode_name is not None and benchmark_example_id is not None and trial_index is not None:
+            target = by_example_key.get((mode_name, benchmark_example_id, trial_index))
+        if target is None:
+            continue
+
+        if row.get("benchmark_primary_metric_name"):
+            target.benchmark_primary_metric_name = str(row["benchmark_primary_metric_name"])
+
+        if row.get("benchmark_primary_metric_value") not in (None, ""):
+            target.benchmark_primary_metric_value = float(row["benchmark_primary_metric_value"])
+
+        for field_name in EXTERNAL_BENCHMARK_SCORE_FIELDS:
+            value = row.get(field_name)
+            if value not in (None, ""):
+                setattr(target, field_name, float(value))
+
+        applied += 1
+
+    return applied
 
 def save_test_table_md(rows: List[dict], output_path: Path, title: str, columns: List[str]) -> None:
     """
@@ -765,6 +940,8 @@ def main() -> None:
             "energy_per_token_j_mean",
             "peak_gpu_memory_mb_mean",
             "reference_rouge_l_f1_mean",
+            "benchmark_primary_metric_name",
+            "benchmark_primary_metric_value_mean",
             "failure_rate",
         ],
     )
@@ -782,6 +959,7 @@ def main() -> None:
             "energy_per_token_ratio_vs_baseline",
             "peak_gpu_memory_delta_vs_baseline_mb",
             "quality_degradation_vs_baseline_mean",
+            "benchmark_primary_metric_delta_vs_baseline",
             "failure_rate",
         ],
     )

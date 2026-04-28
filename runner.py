@@ -26,6 +26,7 @@ from model_loader import LoadedModelBundle, load_model_for_mode, unload_model
 from workloads import RuntimeWorkload, build_runtime_workload_by_name
 from metrics import (
     BenchmarkResult,
+    compute_benchmark_suite_metrics,
     compute_exact_match,
     compute_rouge_l_f1,
     compute_token_f1,
@@ -274,6 +275,52 @@ def _count_output_tokens_for_texts(tokenizer, output_texts: List[str]) -> Option
         counts.append(count)
     return sum(counts)
 
+def _mean_optional(values: List[Optional[float]]) -> Optional[float]:
+    """
+    Mean over non-None numeric values.
+    """
+    valid = [float(v) for v in values if v is not None]
+    if not valid:
+        return None
+    return sum(valid) / len(valid)
+
+
+def _apply_mean_benchmark_metric_dicts(
+    result: BenchmarkResult,
+    metric_dicts: List[dict],
+) -> None:
+    """
+    Aggregate per-output benchmark metric dicts back onto one BenchmarkResult.
+    """
+    if not metric_dicts:
+        return
+
+    primary_metric_names = [
+        d.get("benchmark_primary_metric_name")
+        for d in metric_dicts
+        if d.get("benchmark_primary_metric_name")
+    ]
+    if primary_metric_names:
+        result.benchmark_primary_metric_name = primary_metric_names[0]
+
+    numeric_metric_fields = [
+        "benchmark_primary_metric_value",
+        "mmlu_pro_accuracy",
+        "gsm8k_exact_match_accuracy",
+        "truthfulqa_accuracy",
+        "gpqa_accuracy",
+        "mlu_accuracy",
+        "tam_accuracy",
+        "mt_bench_score",
+        "alpacaeval2_lc_win_rate",
+    ]
+
+    for field_name in numeric_metric_fields:
+        setattr(
+            result,
+            field_name,
+            _mean_optional([metric_dict.get(field_name) for metric_dict in metric_dicts]),
+        )
 
 def _sanitize_output_text(text: str) -> str:
     """
@@ -346,6 +393,69 @@ def _build_batched_prompts(base_prompt: str, batch_size: int) -> List[str]:
         )
     return prompts
 
+
+def _resolve_system_prompt_for_workload(workload: RuntimeWorkload) -> Optional[str]:
+    """
+    Provide a benchmark-aware system prompt for instruct/chat models.
+    """
+    evaluation_mode = str(getattr(workload, "evaluation_mode", "") or "").strip().lower()
+
+    if evaluation_mode in {"multiple_choice", "multiple_choice_accuracy"}:
+        return (
+            "You are taking a multiple-choice evaluation. "
+            "Choose the single best answer and follow the required output format exactly. "
+            "Do not add explanations."
+        )
+
+    if evaluation_mode == "final_answer_exact_match":
+        return (
+            "You are solving a math evaluation problem. "
+            "Follow the required final answer format exactly."
+        )
+
+    return None
+
+def _format_prompt_for_instruct_model(tokenizer, prompt: str, system_prompt: Optional[str] = None):
+    """
+    Apply the tokenizer chat template when available.
+
+    This is important for instruct models like Llama-3.1-Instruct.
+    Without it, the model may behave more like raw text completion.
+
+    Returns:
+        (formatted_prompt, used_chat_template)
+    """
+    if tokenizer is None:
+        return prompt, False
+
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if not chat_template:
+        return prompt, False
+
+    # Avoid double-wrapping prompts that already look templated.
+    if any(marker in prompt for marker in (
+        "<|begin_of_text|>",
+        "<|start_header_id|>",
+        "[INST]",
+        "<s>[INST]",
+    )):
+        return prompt, False
+
+    try:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        formatted = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return formatted, True
+    except Exception:
+        return prompt, False
+
 def _estimate_bytes_per_element_from_runtime_mode(runtime_mode: RuntimeMode) -> int:
     """
     Estimate bytes per KV-cache element from the configured KV-cache dtype.
@@ -397,7 +507,16 @@ def _estimate_kv_cache_mb(
     try:
         prompt_token_total = 0
         for prompt in prompts:
-            prompt_token_total += len(bundle.tokenizer.encode(prompt, add_special_tokens=False))
+            formatted_prompt, used_chat_template = _format_prompt_for_instruct_model(
+                bundle.tokenizer,
+                prompt,
+            )
+            prompt_token_total += len(
+                bundle.tokenizer.encode(
+                    formatted_prompt,
+                    add_special_tokens=not used_chat_template,
+                )
+            )
     except Exception:
         return None
 
@@ -664,6 +783,18 @@ def _run_vllm_generate(
     if prompts is None:
         prompts = [workload.prompt]
 
+    system_prompt = _resolve_system_prompt_for_workload(workload)
+
+    formatted_prompts = []
+    for prompt in prompts:
+        formatted_prompt, _ = _format_prompt_for_instruct_model(
+            bundle.tokenizer,
+            prompt,
+            system_prompt=system_prompt,
+        )
+        formatted_prompts.append(formatted_prompt)
+    prompts = formatted_prompts
+
     max_new_tokens = (
         max_new_tokens_override
         if max_new_tokens_override is not None
@@ -713,12 +844,19 @@ def _run_transformers_generate(
 
     tokenizer = bundle.tokenizer
     model = bundle.model
+    system_prompt = _resolve_system_prompt_for_workload(workload)
+    prompt, used_chat_template = _format_prompt_for_instruct_model(
+        tokenizer=tokenizer,
+        prompt=prompt,
+        system_prompt=system_prompt,
+    )
 
     encoded = tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
         max_length=CONFIG.model.max_model_len,
+        add_special_tokens=not used_chat_template,
     )
 
     if torch is not None and torch.cuda.is_available() and CONFIG.model.device.startswith("cuda"):
@@ -862,6 +1000,11 @@ def run_single_benchmark(
         workload_cell=workload.workload_cell,
         task_type=workload.task_type,
         system_condition=workload.system_condition_name,
+        benchmark_suite=workload.benchmark_suite,
+        benchmark_subset=workload.benchmark_subset,
+        benchmark_language=workload.benchmark_language,
+        evaluation_mode=workload.evaluation_mode,
+        benchmark_example_id=workload.benchmark_example_id,
     )
 
     try:
@@ -1008,9 +1151,70 @@ def run_single_benchmark(
             expected_reference = workload.reference_answer
 
         if CONFIG.system.collect_quality_metrics and expected_reference:
-            result.reference_exact_match = compute_exact_match(result.output_text, expected_reference)
-            result.reference_rouge_l_f1 = compute_rouge_l_f1(result.output_text, expected_reference)
-            result.reference_token_f1 = compute_token_f1(result.output_text, expected_reference)
+            if len(output_texts) == 1:
+                quality_prediction_text = output_texts[0]
+                result.reference_exact_match = compute_exact_match(
+                    quality_prediction_text,
+                    expected_reference,
+                )
+                result.reference_rouge_l_f1 = compute_rouge_l_f1(
+                    quality_prediction_text,
+                    expected_reference,
+                )
+                result.reference_token_f1 = compute_token_f1(
+                    quality_prediction_text,
+                    expected_reference,
+                )
+            else:
+                exact_matches = [
+                    compute_exact_match(prediction_text, expected_reference)
+                    for prediction_text in output_texts
+                ]
+                rouge_scores = [
+                    compute_rouge_l_f1(prediction_text, expected_reference)
+                    for prediction_text in output_texts
+                ]
+                token_f1_scores = [
+                    compute_token_f1(prediction_text, expected_reference)
+                    for prediction_text in output_texts
+                ]
+
+                valid_exact = [value for value in exact_matches if value is not None]
+                if valid_exact:
+                    result.reference_exact_match = all(valid_exact)
+                result.reference_rouge_l_f1 = _mean_optional(rouge_scores)
+                result.reference_token_f1 = _mean_optional(token_f1_scores)
+
+        if CONFIG.system.collect_quality_metrics:
+            if len(output_texts) == 1:
+                benchmark_metric_values = compute_benchmark_suite_metrics(
+                    prediction=output_texts[0],
+                    reference=expected_reference,
+                    benchmark_suite=workload.benchmark_suite,
+                    evaluation_mode=workload.evaluation_mode,
+                    metadata=workload.metadata or {},
+                )
+                for key, value in benchmark_metric_values.items():
+                    setattr(result, key, value)
+            else:
+                per_output_metric_dicts = [
+                    compute_benchmark_suite_metrics(
+                        prediction=prediction_text,
+                        reference=expected_reference,
+                        benchmark_suite=workload.benchmark_suite,
+                        evaluation_mode=workload.evaluation_mode,
+                        metadata=workload.metadata or {},
+                    )
+                    for prediction_text in output_texts
+                ]
+                _apply_mean_benchmark_metric_dicts(result, per_output_metric_dicts)
+
+            if workload.benchmark_suite in {"mt_bench", "alpacaeval_2_lc", "alpacaeval2_lc"}:
+                if result.benchmark_primary_metric_value is None:
+                    result.notes += (
+                        "This benchmark suite typically requires an external judge / sidecar scorer; "
+                        "schema fields are present, but no judge score was supplied for this run. "
+                    )
 
         measured_energy_j = energy_poller.get_total_energy_joules()
         if measured_energy_j is not None:

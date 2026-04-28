@@ -70,6 +70,15 @@ FLOAT_METRICS = [
     "reference_token_f1",
     "baseline_similarity_rouge_l_f1",
     "quality_degradation_vs_baseline",
+    "benchmark_primary_metric_value",
+    "mmlu_pro_accuracy",
+    "gsm8k_exact_match_accuracy",
+    "truthfulqa_accuracy",
+    "gpqa_accuracy",
+    "mlu_accuracy",
+    "tam_accuracy",
+    "mt_bench_score",
+    "alpacaeval2_lc_win_rate",
 ]
 
 DEFAULT_DELTA_METRICS = [
@@ -83,6 +92,43 @@ DEFAULT_DELTA_METRICS = [
     "baseline_similarity_rouge_l_f1",
     "quality_degradation_vs_baseline",
 ]
+
+HIGHER_IS_BETTER_METRICS = {
+    "tokens_per_second",
+    "batched_tokens_per_second",
+    "prefill_throughput_tps",
+    "decode_throughput_tps",
+    "reference_exact_match",
+    "reference_rouge_l_f1",
+    "reference_token_f1",
+    "baseline_similarity_rouge_l_f1",
+    "benchmark_primary_metric_value",
+    "mmlu_pro_accuracy",
+    "gsm8k_exact_match_accuracy",
+    "truthfulqa_accuracy",
+    "gpqa_accuracy",
+    "mlu_accuracy",
+    "tam_accuracy",
+    "mt_bench_score",
+    "alpacaeval2_lc_win_rate",
+}
+
+BENCHMARK_DISPLAY_METRICS = [
+    ("MMLU-Pro", "mmlu_pro_accuracy"),
+    ("GSM8K EM", "gsm8k_exact_match_accuracy"),
+    ("TruthfulQA", "truthfulqa_accuracy"),
+    ("GPQA", "gpqa_accuracy"),
+    ("MLU", "mlu_accuracy"),
+    ("TAM", "tam_accuracy"),
+    ("MT-Bench", "mt_bench_score"),
+    ("AlpacaEval2 LC", "alpacaeval2_lc_win_rate"),
+]
+
+QUALITY_METRIC_DISPLAY_NAMES = {
+    "reference_rouge_l_f1": "Qual",
+    "benchmark_primary_metric_value": "BenchmarkScore",
+    **{metric_name: display_name for display_name, metric_name in BENCHMARK_DISPLAY_METRICS},
+}
 
 def _get_baseline_mode_name() -> str:
     """Resolve the configured baseline mode name with a safe fallback."""
@@ -345,6 +391,26 @@ def _infer_system_condition(row: dict) -> str:
 
     return "baseline"
 
+def _group_workload_name_from_row(row: dict) -> str:
+    """
+    Collapse sidecar-expanded benchmark example names back to their parent workload.
+
+    Example:
+        mmlu_pro_eval__q0001 -> mmlu_pro_eval
+    """
+    workload_name = row.get("workload_name")
+    if (
+        isinstance(workload_name, str)
+        and "__" in workload_name
+        and (
+            row.get("benchmark_example_id") is not None
+            or row.get("benchmark_suite") is not None
+            or row.get("benchmark_primary_metric_name") is not None
+            or row.get("benchmark_primary_metric_value") is not None
+        )
+    ):
+        return workload_name.split("__", 1)[0]
+    return workload_name
 
 def _enrich_result_row(row: dict) -> dict:
     """
@@ -357,6 +423,10 @@ def _enrich_result_row(row: dict) -> dict:
 
     # Derive a simple system-condition label if it is not already present.
     enriched.setdefault("system_condition", _infer_system_condition(row))
+
+    # Derive a workload-group label so benchmark example rows aggregate back
+    # to the parent benchmark workload.
+    enriched["workload_group_name"] = _group_workload_name_from_row(enriched)
 
     # Add GB-converted aliases because those are easier to read in reports.
     peak_mb = enriched.get("peak_gpu_memory_mb")
@@ -395,7 +465,7 @@ def prepare_results(results: Sequence[dict]) -> List[dict]:
 
 def aggregate_results(
     results: List[dict],
-    group_by: Tuple[str, ...] = ("mode_name", "workload_name", "system_condition"),
+    group_by: Tuple[str, ...] = ("mode_name", "workload_group_name", "system_condition"),
 ) -> Dict[tuple, dict]:
     """
     Group raw sample results by the specified keys and compute summary statistics.
@@ -420,16 +490,36 @@ def aggregate_results(
         first = successful_rows[0]
         failure_count = len(group_rows) - len(successful_rows)
         failure_rate = (failure_count / len(group_rows)) if group_rows else None
+        benchmark_primary_metric_name = next(
+            (
+                row.get("benchmark_primary_metric_name")
+                for row in successful_rows
+                if row.get("benchmark_primary_metric_name")
+            ),
+            next(
+                (
+                    row.get("benchmark_primary_metric_name")
+                    for row in group_rows
+                    if row.get("benchmark_primary_metric_name")
+                ),
+                None,
+            ),
+        )
 
         aggregate_row = {
             "n": len(successful_rows),
             "num_runs": len(group_rows),
             "group_keys": dict(zip(group_by, key)),
             "mode_name": first.get("mode_name"),
-            "workload_name": first.get("workload_name"),
+            "workload_name": first.get("workload_group_name") or first.get("workload_name"),
             "workload_cell": first.get("workload_cell"),
             "system_condition": first.get("system_condition"),
             "backend": first.get("backend"),
+            "benchmark_suite": first.get("benchmark_suite"),
+            "benchmark_subset": first.get("benchmark_subset"),
+            "benchmark_language": first.get("benchmark_language"),
+            "evaluation_mode": first.get("evaluation_mode"),
+            "benchmark_primary_metric_name": benchmark_primary_metric_name,
             "baseline_mode_name": _get_baseline_mode_name(),
             "num_requests_in_batch_mean": _safe_mean(
                 row.get("num_requests_in_batch") for row in successful_rows
@@ -460,7 +550,7 @@ def aggregate_results(
 
 def build_failure_summary(
     results: List[dict],
-    group_by: Tuple[str, ...] = ("mode_name", "workload_name", "system_condition"),
+    group_by: Tuple[str, ...] = ("mode_name", "workload_group_name", "system_condition"),
 ) -> Dict[tuple, dict]:
     """
     Summarize failures separately so we do not lose reliability information.
@@ -490,7 +580,7 @@ def build_failure_summary(
         first = group_rows[0]
         summary[key] = {
             "mode_name": first.get("mode_name"),
-            "workload_name": first.get("workload_name"),
+            "workload_name": first.get("workload_group_name") or first.get("workload_name"),
             "workload_cell": first.get("workload_cell"),
             "system_condition": first.get("system_condition"),
             "num_runs": len(group_rows),
@@ -651,6 +741,15 @@ def _resolve_quality_metric_name(
         return preferred
 
     candidates = [
+        "benchmark_primary_metric_value",
+        "mmlu_pro_accuracy",
+        "gsm8k_exact_match_accuracy",
+        "truthfulqa_accuracy",
+        "gpqa_accuracy",
+        "mlu_accuracy",
+        "tam_accuracy",
+        "mt_bench_score",
+        "alpacaeval2_lc_win_rate",
         "reference_rouge_l_f1",
         "baseline_similarity_rouge_l_f1",
         "quality_degradation_vs_baseline",
@@ -753,6 +852,11 @@ def flatten_aggregated_results(aggregated: Dict[tuple, dict]) -> List[dict]:
             "workload_cell": agg.get("workload_cell"),
             "system_condition": agg.get("system_condition"),
             "backend": agg.get("backend"),
+            "benchmark_suite": agg.get("benchmark_suite"),
+            "benchmark_subset": agg.get("benchmark_subset"),
+            "benchmark_language": agg.get("benchmark_language"),
+            "evaluation_mode": agg.get("evaluation_mode"),
+            "benchmark_primary_metric_name": agg.get("benchmark_primary_metric_name"),
             "n": agg.get("n"),
             "failure_count": agg.get("failure_count"),
             "failure_rate": agg.get("failure_rate"),
@@ -811,7 +915,7 @@ def build_winner_rows(
     for agg in aggregated.values():
         grouped[(agg.get("workload_name"), agg.get("system_condition"))].append(agg)
 
-    quality_minimize = quality_metric_name == "quality_degradation_vs_baseline"
+    quality_minimize = quality_metric_name not in HIGHER_IS_BETTER_METRICS
     rows: List[dict] = []
 
     def _pick(entries: List[dict], metric_name: str, minimize: bool):
@@ -870,6 +974,11 @@ def generate_markdown_report(
     lines: List[str] = []
     add_line = lines.append
 
+    quality_metric_display_name = QUALITY_METRIC_DISPLAY_NAMES.get(
+        quality_metric_name,
+        quality_metric_name,
+    )
+
     add_line("# ModeSwitch-LLM Benchmark Report")
     add_line("")
     add_line(f"**Run ID:** `{run_id}`")
@@ -887,6 +996,7 @@ def generate_markdown_report(
     )
     add_line("")
 
+
     headers = [
         "Mode",
         "Workload",
@@ -901,7 +1011,7 @@ def generate_markdown_report(
         "Total_tps",
         "GPU_MB",
         "E/tok",
-        "Qual",
+        quality_metric_display_name,
     ]
     add_line("| " + " | ".join(headers) + " |")
     add_line("| " + " | ".join(["---"] * len(headers)) + " |")
@@ -930,6 +1040,48 @@ def generate_markdown_report(
 
     add_line("")
 
+    # -------------------------------------------------------------------------
+    # Benchmark accuracy / chat quality section
+    # -------------------------------------------------------------------------
+    benchmark_rows = []
+    for (mode_name, workload_name, system_condition), row in sorted(aggregated.items()):
+        rendered_values = []
+        any_present = False
+        for _, metric_name in BENCHMARK_DISPLAY_METRICS:
+            metric_stats = row.get(metric_name, {})
+            metric_mean = metric_stats.get("mean") if isinstance(metric_stats, dict) else None
+            if metric_mean is None:
+                rendered_values.append("—")
+            else:
+                any_present = True
+                rendered_values.append(f"{metric_mean:.4f}")
+
+        if any_present:
+            benchmark_rows.append(
+                (
+                    mode_name,
+                    workload_name,
+                    row.get("workload_cell", "—"),
+                    system_condition,
+                    rendered_values,
+                )
+            )
+
+    if benchmark_rows:
+        lines.append("## 1b. Benchmark Accuracy / Chat Quality")
+        lines.append("")
+        header = "| Mode | Workload | Cell | Cond | " + " | ".join(name for name, _ in BENCHMARK_DISPLAY_METRICS) + " |"
+        sep = "| --- | --- | --- | --- | " + " | ".join(["---"] * len(BENCHMARK_DISPLAY_METRICS)) + " |"
+        lines.append(header)
+        lines.append(sep)
+        for mode_name, workload_name, workload_cell, system_condition, rendered_values in benchmark_rows:
+            lines.append(
+                f"| {mode_name} | {workload_name} | {workload_cell} | {system_condition} | "
+                + " | ".join(rendered_values)
+                + " |"
+            )
+        lines.append("")
+
     # ---------------------------------------------------------------------
     # Section 2: deltas vs baseline
     # ---------------------------------------------------------------------
@@ -956,7 +1108,7 @@ def generate_markdown_report(
         "Energy_x",
         "ΔE/tok",
         "ΔGPU_MB",
-        f"Δ{quality_metric_name}",
+        f"Δ{quality_metric_display_name}",
     ]
     add_line("| " + " | ".join(delta_headers) + " |")
     add_line("| " + " | ".join(["---"] * len(delta_headers)) + " |")
@@ -1183,7 +1335,8 @@ def _generate_observations(
             qual_by_workload[agg.get("workload_name")].append(agg)
 
     for workload_name, entries in qual_by_workload.items():
-        if quality_metric_name == "quality_degradation_vs_baseline":
+        quality_minimize = quality_metric_name not in HIGHER_IS_BETTER_METRICS
+        if quality_minimize:
             best_entry = min(entries, key=lambda a: (a.get(quality_metric_name) or {}).get("mean"))
             observations.append(
                 f"- **{workload_name}**: the lowest `{quality_metric_name}` is achieved by `{best_entry.get('mode_name')}` "
@@ -1437,16 +1590,23 @@ def generate_full_report(
 
     aggregated = aggregate_results(prepared_results)
     failure_summary = build_failure_summary(prepared_results)
-    delta_table = compute_delta_table(aggregated, baseline_mode=baseline_mode)
+    quality_metric_name = _resolve_quality_metric_name(aggregated, preferred=quality_metric)
+    delta_metrics = list(DEFAULT_DELTA_METRICS)
+    if quality_metric_name not in delta_metrics:
+        delta_metrics.append(quality_metric_name)
+    delta_table = compute_delta_table(
+        aggregated,
+        baseline_mode=baseline_mode,
+        metrics_to_compare=delta_metrics,
+    )
     phase_dominance = compute_phase_dominance(aggregated)
 
-    quality_metric_name = _resolve_quality_metric_name(aggregated, preferred=quality_metric)
     pareto = find_pareto_frontier(
         aggregated,
         obj1_metric="energy_per_token_j",
         obj2_metric=quality_metric_name,
         obj1_minimize=True,
-        obj2_minimize=(quality_metric_name == "quality_degradation_vs_baseline"),
+        obj2_minimize=(quality_metric_name not in HIGHER_IS_BETTER_METRICS),
     )
 
     if output_dir is None:
@@ -1531,7 +1691,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quality-metric",
         default="auto",
-        choices=["auto", "reference_rouge_l_f1", "baseline_similarity_rouge_l_f1", "quality_degradation_vs_baseline"],
+        choices=[
+            "auto",
+            "reference_rouge_l_f1",
+            "baseline_similarity_rouge_l_f1",
+            "quality_degradation_vs_baseline",
+            "benchmark_primary_metric_value",
+            "mmlu_pro_accuracy",
+            "gsm8k_exact_match_accuracy",
+            "truthfulqa_accuracy",
+            "gpqa_accuracy",
+            "mlu_accuracy",
+            "tam_accuracy",
+            "mt_bench_score",
+            "alpacaeval2_lc_win_rate",
+        ],
         help="Quality metric to use for reporting and Pareto analysis.",
     )
     parser.add_argument(

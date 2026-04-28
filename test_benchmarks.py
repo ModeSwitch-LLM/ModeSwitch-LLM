@@ -38,6 +38,17 @@ def _make_fake_result(
     reference_rouge_l_f1: float = 0.42,
     baseline_similarity_rouge_l_f1: float | None = None,
     quality_degradation_vs_baseline: float | None = None,
+    benchmark_suite: str | None = None,
+    evaluation_mode: str | None = None,
+    benchmark_primary_metric_value: float | None = None,
+    mmlu_pro_accuracy: float | None = None,
+    gsm8k_exact_match_accuracy: float | None = None,
+    truthfulqa_accuracy: float | None = None,
+    gpqa_accuracy: float | None = None,
+    mlu_accuracy: float | None = None,
+    tam_accuracy: float | None = None,
+    mt_bench_score: float | None = None,
+    alpacaeval2_lc_win_rate: float | None = None,
     success: bool = True,
     error: str | None = None,
     error_type: str | None = None,
@@ -81,6 +92,17 @@ def _make_fake_result(
         "reference_token_f1": 0.50,
         "baseline_similarity_rouge_l_f1": baseline_similarity_rouge_l_f1,
         "quality_degradation_vs_baseline": quality_degradation_vs_baseline,
+        "benchmark_suite": benchmark_suite,
+        "evaluation_mode": evaluation_mode,
+        "benchmark_primary_metric_value": benchmark_primary_metric_value,
+        "mmlu_pro_accuracy": mmlu_pro_accuracy,
+        "gsm8k_exact_match_accuracy": gsm8k_exact_match_accuracy,
+        "truthfulqa_accuracy": truthfulqa_accuracy,
+        "gpqa_accuracy": gpqa_accuracy,
+        "mlu_accuracy": mlu_accuracy,
+        "tam_accuracy": tam_accuracy,
+        "mt_bench_score": mt_bench_score,
+        "alpacaeval2_lc_win_rate": alpacaeval2_lc_win_rate,
         "success": success,
         "error": error,
         "error_type": error_type,
@@ -166,6 +188,30 @@ class TestAggregation(unittest.TestCase):
         row = agg[("fp16_baseline", "short_prompt_short_output", "baseline")]
         self.assertAlmostEqual(row["ttft_ms"]["mean"], 20.5, places=3)
         self.assertEqual(row["n"], 2)
+
+    def test_benchmark_accuracy_aggregates(self):
+        results = [
+            _make_fake_result(
+                mode_name="mmlu_mode",
+                workload_name="mmlu_pro_dev",
+                benchmark_suite="mmlu_pro",
+                evaluation_mode="multiple_choice_accuracy",
+                mmlu_pro_accuracy=1.0,
+                benchmark_primary_metric_value=1.0,
+            ),
+            _make_fake_result(
+                mode_name="mmlu_mode",
+                workload_name="mmlu_pro_dev",
+                benchmark_suite="mmlu_pro",
+                evaluation_mode="multiple_choice_accuracy",
+                mmlu_pro_accuracy=0.0,
+                benchmark_primary_metric_value=0.0,
+            ),
+        ]
+        agg = aggregate_results(results)
+        row = agg[("mmlu_mode", "mmlu_pro_dev", "baseline")]
+        self.assertAlmostEqual(row["mmlu_pro_accuracy"]["mean"], 0.5, places=4)
+        self.assertAlmostEqual(row["benchmark_primary_metric_value"]["mean"], 0.5, places=4)
 
     def test_errors_excluded_from_metric_aggregation(self):
         results = self.results + [
@@ -317,6 +363,10 @@ class TestMarkdownReport(unittest.TestCase):
                 energy_per_token_j=0.29,
                 peak_gpu_memory_mb=6200.0,
                 reference_rouge_l_f1=0.41,
+                benchmark_suite="mmlu_pro",
+                evaluation_mode="multiple_choice_accuracy",
+                mmlu_pro_accuracy=0.75,
+                benchmark_primary_metric_value=0.75,
             ),
         ]
         aggregated = aggregate_results(results)
@@ -340,6 +390,7 @@ class TestMarkdownReport(unittest.TestCase):
             self.assertIn("ModeSwitch-LLM Benchmark Report", content)
             self.assertIn("fp16_baseline", content)
             self.assertIn("awq_4bit", content)
+            self.assertIn("MMLU-Pro", content)
 
 
 if __name__ == "__main__":

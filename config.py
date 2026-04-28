@@ -42,6 +42,8 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 # Temporary files if needed.
 TMP_DIR = PROJECT_ROOT / "tmp"
 
+# Benchmark-sidecar files (JSONL / JSON / CSV) for benchmark-style workloads.
+BENCHMARK_DATA_DIR = PROJECT_ROOT / "benchmark_data"
 
 # =============================================================================
 # Basic runtime / model config
@@ -289,6 +291,19 @@ class WorkloadConfig:
     # Whether this workload is meant to run under memory pressure.
     memory_pressure: bool = False
 
+    # Optional benchmark-suite metadata.
+    benchmark_suite: Optional[str] = None
+    benchmark_subset: Optional[str] = None
+    benchmark_language: Optional[str] = None
+    evaluation_mode: Optional[str] = None
+
+    # Optional path to a sidecar file containing concrete benchmark examples.
+    # Supports JSONL, JSON(list[dict]), or CSV.
+    benchmark_source_path: Optional[str] = None
+
+    # Whether this workload requires an external judge / sidecar scorer after generation.
+    benchmark_judge_required: bool = False
+
     # Optional custom metadata for later grouping/filtering.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -487,6 +502,92 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         system_condition="mem_pressure_50",
         metadata={"workload_family": "memory_pressure"},
     ),
+    WorkloadConfig(
+        name="mmlu_pro_eval",
+        prompt_tokens=512,
+        max_new_tokens=8,
+        description="Sidecar-backed MMLU-Pro evaluation workload",
+        task_type="benchmark",
+        benchmark_suite="mmlu_pro",
+        benchmark_language="en",
+        evaluation_mode="multiple_choice_accuracy",
+        benchmark_source_path="mmlu_pro_eval.jsonl",
+        metadata={"benchmark_family": "knowledge_reasoning"},
+    ),
+    WorkloadConfig(
+        name="gsm8k_eval",
+        prompt_tokens=512,
+        max_new_tokens=384,
+        description="Sidecar-backed GSM8K evaluation workload",
+        task_type="benchmark",
+        benchmark_suite="gsm8k",
+        benchmark_language="en",
+        evaluation_mode="final_answer_exact_match",
+        benchmark_source_path="gsm8k_eval.jsonl",
+        metadata={"benchmark_family": "math_reasoning"},
+    ),
+    WorkloadConfig(
+        name="truthfulqa_eval",
+        prompt_tokens=512,
+        max_new_tokens=8,
+        description="Sidecar-backed TruthfulQA evaluation workload",
+        task_type="benchmark",
+        benchmark_suite="truthfulqa",
+        benchmark_language="en",
+        evaluation_mode="multiple_choice_accuracy",
+        benchmark_source_path="truthfulqa_eval.jsonl",
+        metadata={"benchmark_family": "truthfulness"},
+    ),
+    WorkloadConfig(
+        name="gpqa_eval",
+        prompt_tokens=512,
+        max_new_tokens=8,
+        description="Sidecar-backed GPQA evaluation workload",
+        task_type="benchmark",
+        benchmark_suite="gpqa",
+        benchmark_language="en",
+        evaluation_mode="multiple_choice_accuracy",
+        benchmark_source_path="gpqa_eval.jsonl",
+        metadata={"benchmark_family": "science_reasoning"},
+    ),
+    WorkloadConfig(
+        name="mlu_eval",
+        prompt_tokens=512,
+        max_new_tokens=8,
+        description="Sidecar-backed MLU evaluation workload",
+        task_type="benchmark",
+        benchmark_suite="mlu",
+        benchmark_language="multilingual",
+        evaluation_mode="multiple_choice_accuracy",
+        benchmark_source_path="mlu_eval.jsonl",
+        metadata={"benchmark_family": "multilingual_understanding"},
+    ),
+    WorkloadConfig(
+        name="mt_bench_eval",
+        prompt_tokens=512,
+        max_new_tokens=1024,
+        description="Sidecar-backed MT-Bench evaluation workload",
+        task_type="benchmark",
+        benchmark_suite="mt_bench",
+        benchmark_language="en",
+        evaluation_mode="external_judge",
+        benchmark_source_path="mt_bench_eval.jsonl",
+        benchmark_judge_required=True,
+        metadata={"benchmark_family": "chat_quality"},
+    ),
+    WorkloadConfig(
+        name="alpacaeval2_lc_eval",
+        prompt_tokens=512,
+        max_new_tokens=512,
+        description="Sidecar-backed AlpacaEval 2 LC evaluation workload",
+        task_type="benchmark",
+        benchmark_suite="alpacaeval2_lc",
+        benchmark_language="en",
+        evaluation_mode="external_judge",
+        benchmark_source_path="alpacaeval2_lc_eval.jsonl",
+        benchmark_judge_required=True,
+        metadata={"benchmark_family": "chat_quality"},
+    ),
 ]
 
 
@@ -526,6 +627,7 @@ def ensure_directories() -> None:
         PLOTS_DIR,
         LOGS_DIR,
         TMP_DIR,
+        BENCHMARK_DATA_DIR,
     ]:
         directory.mkdir(parents=True, exist_ok=True)
 
