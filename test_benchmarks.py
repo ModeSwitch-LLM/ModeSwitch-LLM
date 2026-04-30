@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from controller import classify_request, route_runtime_workload
+from controller.features import RequestFeatures
 from reporter import (
     aggregate_results,
     build_failure_summary,
@@ -15,6 +17,7 @@ from reporter import (
 )
 
 from modes import build_runtime_mode_by_name
+from workloads import build_runtime_workload_by_name, build_runtime_workloads_for_name
 
 def _make_fake_result(
     mode_name: str = "fp16_baseline",
@@ -353,6 +356,58 @@ class TestModeResolution(unittest.TestCase):
         self.assertTrue(mode.continuous_batching)
         self.assertEqual(mode.quantization, "compressed-tensors")
 
+    def test_controller_mode_can_be_built_by_name(self):
+        mode = build_runtime_mode_by_name("controller_v1")
+        self.assertEqual(mode.name, "controller_v1")
+        self.assertEqual(mode.runner_kwargs.get("controller_name"), "controller_v1")
+
+
+class TestControllerRouting(unittest.TestCase):
+
+    def test_classifier_marks_mcq_style_request_prefill_heavy(self):
+        features = RequestFeatures(
+            prompt_tokens=512,
+            expected_output_tokens=8,
+            shared_prefix=False,
+            batch_pressure="normal",
+            memory_pressure=False,
+        )
+        classification = classify_request(features)
+        self.assertEqual(classification.label, "prefill_heavy")
+        self.assertGreater(classification.estimated_prefill_share_pct, 40.0)
+
+    def test_classifier_marks_long_generation_decode_heavy(self):
+        features = RequestFeatures(
+            prompt_tokens=128,
+            expected_output_tokens=256,
+            shared_prefix=False,
+            batch_pressure="normal",
+            memory_pressure=False,
+        )
+        classification = classify_request(features)
+        self.assertEqual(classification.label, "decode_heavy")
+
+    def test_shared_prefix_workload_routes_to_gptq_prefix_combo(self):
+        workload = build_runtime_workload_by_name(
+            "shared_prefix_chat",
+            repeated_prefix_variant=0,
+        )
+        decision = route_runtime_workload(workload)
+        self.assertEqual(decision.selected_mode_name, "gptq_plus_prefix_caching")
+        self.assertEqual(decision.classification_label, "chat_shared_prefix")
+
+    def test_prefill_heavy_eval_routes_to_fp16(self):
+        workload = build_runtime_workloads_for_name("mmlu_pro_eval")[0]
+        decision = route_runtime_workload(workload)
+        self.assertEqual(decision.selected_mode_name, "fp16_baseline")
+        self.assertEqual(decision.classification_label, "prefill_heavy")
+
+    def test_decode_heavy_eval_routes_to_gptq(self):
+        workload = build_runtime_workloads_for_name("gsm8k_eval")[0]
+        decision = route_runtime_workload(workload)
+        self.assertEqual(decision.selected_mode_name, "gptq_4bit")
+        self.assertEqual(decision.classification_label, "decode_heavy")
+
 
 class TestMarkdownReport(unittest.TestCase):
     def test_markdown_report_generation(self):
@@ -374,8 +429,8 @@ class TestMarkdownReport(unittest.TestCase):
         phase = compute_phase_dominance(aggregated)
         failures = build_failure_summary(results)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out = Path(tmpdir) / "report.md"
+        out = Path("tmp_report_test.md")
+        try:
             generate_markdown_report(
                 aggregated=aggregated,
                 delta_table=deltas,
@@ -391,6 +446,9 @@ class TestMarkdownReport(unittest.TestCase):
             self.assertIn("fp16_baseline", content)
             self.assertIn("awq_4bit", content)
             self.assertIn("MMLU-Pro", content)
+        finally:
+            if out.exists():
+                out.unlink()
 
 
 if __name__ == "__main__":

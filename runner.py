@@ -21,6 +21,7 @@ import warnings
 from typing import List, Optional
 from threading import Thread, Event
 from config import CONFIG
+from controller import route_runtime_workload
 from modes import RuntimeMode, build_runtime_mode_by_name
 from model_loader import LoadedModelBundle, load_model_for_mode, unload_model
 from workloads import RuntimeWorkload, build_runtime_workload_by_name
@@ -984,6 +985,28 @@ def run_single_benchmark(
     Returns:
         Finalized BenchmarkResult
     """
+    controller_name = runtime_mode.runner_kwargs.get("controller_name")
+    if controller_name:
+        decision = route_runtime_workload(workload)
+        delegated_mode = build_runtime_mode_by_name(decision.selected_mode_name)
+        delegated_result = run_single_benchmark(
+            runtime_mode=delegated_mode,
+            workload=workload,
+            trial_index=trial_index,
+            preloaded_bundle=preloaded_bundle,
+        )
+        delegated_result.mode_name = controller_name
+        delegated_result.controller_selected_mode_name = decision.selected_mode_name
+        delegated_result.controller_phase_label = decision.classification_label
+        delegated_result.controller_estimated_prefill_share_pct = decision.estimated_prefill_share_pct
+        delegated_result.controller_route_reason = decision.reason
+        delegated_result.notes = (
+            f"Controller `{controller_name}` routed this request to `{decision.selected_mode_name}`. "
+            f"{decision.reason} "
+            + (delegated_result.notes or "")
+        )
+        return delegated_result
+
     bundle: Optional[LoadedModelBundle] = preloaded_bundle
     owns_bundle = preloaded_bundle is None
 

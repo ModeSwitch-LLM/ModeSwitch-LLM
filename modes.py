@@ -434,4 +434,18 @@ def get_default_hybrid_modes() -> List[RuntimeMode]:
             primary_phase="decode",
         )
     )
+
+    hybrids.append(
+        RuntimeMode(
+            name="controller_v1",
+            description="Rule-based fixed-mode controller that routes each request to one measured mode",
+            backend=CONFIG.model.backend,
+            primary_phase="both",
+            notes=(
+                "Routes each request once before inference starts using prompt length, output length, "
+                "shared-prefix, and batch-pressure signals."
+            ),
+            runner_kwargs={"controller_name": "controller_v1"},
+        )
+    )
     return hybrids

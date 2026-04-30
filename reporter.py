@@ -19,7 +19,7 @@ import csv
 import json
 import logging
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from config import CONFIG
@@ -79,6 +79,7 @@ FLOAT_METRICS = [
     "tam_accuracy",
     "mt_bench_score",
     "alpacaeval2_lc_win_rate",
+    "controller_estimated_prefill_share_pct",
 ]
 
 DEFAULT_DELTA_METRICS = [
@@ -505,6 +506,21 @@ def aggregate_results(
                 None,
             ),
         )
+        controller_selected_modes = [
+            row.get("controller_selected_mode_name")
+            for row in successful_rows
+            if row.get("controller_selected_mode_name")
+        ]
+        controller_phase_labels = [
+            row.get("controller_phase_label")
+            for row in successful_rows
+            if row.get("controller_phase_label")
+        ]
+        controller_route_reasons = [
+            row.get("controller_route_reason")
+            for row in successful_rows
+            if row.get("controller_route_reason")
+        ]
 
         aggregate_row = {
             "n": len(successful_rows),
@@ -521,6 +537,17 @@ def aggregate_results(
             "evaluation_mode": first.get("evaluation_mode"),
             "benchmark_primary_metric_name": benchmark_primary_metric_name,
             "baseline_mode_name": _get_baseline_mode_name(),
+            "controller_selected_mode_name": (
+                Counter(controller_selected_modes).most_common(1)[0][0]
+                if controller_selected_modes
+                else None
+            ),
+            "controller_phase_label": (
+                Counter(controller_phase_labels).most_common(1)[0][0]
+                if controller_phase_labels
+                else None
+            ),
+            "controller_route_reason": controller_route_reasons[0] if controller_route_reasons else None,
             "num_requests_in_batch_mean": _safe_mean(
                 row.get("num_requests_in_batch") for row in successful_rows
             ),

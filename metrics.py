@@ -142,6 +142,12 @@ class BenchmarkResult:
     mt_bench_score: Optional[float] = None
     alpacaeval2_lc_win_rate: Optional[float] = None
 
+    # Controller-routing metadata for controller_v1 runs
+    controller_selected_mode_name: Optional[str] = None
+    controller_phase_label: Optional[str] = None
+    controller_estimated_prefill_share_pct: Optional[float] = None
+    controller_route_reason: Optional[str] = None
+
     # Free-form notes / errors
     notes: str = ""
     error: Optional[str] = None

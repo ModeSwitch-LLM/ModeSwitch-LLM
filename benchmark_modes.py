@@ -272,18 +272,26 @@ def build_test_plan(
             workload_name,
         )
 
-    # Only include benchmark workloads in the largest profile so the default
-    # curated sweep does not explode in size unexpectedly.
-    if test_profile == "all":
+    # The updated controller project direction needs benchmark workloads in the
+    # normal "controller" profile too, because accuracy retention against FP16
+    # is now a first-class requirement.
+    if test_profile in {"controller", "all"}:
         benchmark_candidate_modes = [
             "fp16_baseline",
             "gptq_4bit",
+            "int8_quant",
             "speculative_decoding",
-            "gptq_plus_prefix_caching",
-            "int8_plus_continuous_batching",
             "prefix_caching",
-            "continuous_batching",
+            "controller_v1",
         ]
+        if test_profile == "all":
+            benchmark_candidate_modes.extend(
+                [
+                    "gptq_plus_prefix_caching",
+                    "int8_plus_continuous_batching",
+                    "continuous_batching",
+                ]
+            )
         for mode_name in benchmark_candidate_modes:
             for workload_name in benchmark_workloads:
                 _add_test_case(
@@ -293,6 +301,20 @@ def build_test_plan(
                     mode_name,
                     workload_name,
                 )
+
+    if test_profile in {"controller", "all"}:
+        controller_workloads = list(dict.fromkeys(baseline_workloads + benchmark_workloads))
+        for workload_name in controller_workloads:
+            _add_test_case(cases, seen, available_mode_names, "controller_v1", workload_name)
+        for variant_id in repeated_variant_ids:
+            _add_test_case(
+                cases,
+                seen,
+                available_mode_names,
+                "controller_v1",
+                "shared_prefix_chat",
+                repeated_prefix_variant=variant_id,
+            )
 
     return cases
 
@@ -566,6 +588,21 @@ def build_aggregate_rows(results: List[BenchmarkResult]) -> List[dict]:
             (r.benchmark_primary_metric_name for r in successful if r.benchmark_primary_metric_name),
             next((r.benchmark_primary_metric_name for r in group if r.benchmark_primary_metric_name), None),
         )
+        selected_controller_modes = [
+            r.controller_selected_mode_name
+            for r in successful
+            if getattr(r, "controller_selected_mode_name", None)
+        ]
+        selected_controller_phases = [
+            r.controller_phase_label
+            for r in successful
+            if getattr(r, "controller_phase_label", None)
+        ]
+        selected_controller_reasons = [
+            r.controller_route_reason
+            for r in successful
+            if getattr(r, "controller_route_reason", None)
+        ]
 
         ttft_values = [result.ttft_ms for result in successful if result.ttft_ms is not None]
         latency_values = [result.total_latency_ms for result in successful if result.total_latency_ms is not None]
@@ -588,6 +625,17 @@ def build_aggregate_rows(results: List[BenchmarkResult]) -> List[dict]:
             "benchmark_language": first.benchmark_language,
             "evaluation_mode": first.evaluation_mode,
             "benchmark_primary_metric_name": benchmark_primary_metric_name,
+            "controller_selected_mode_name": (
+                Counter(selected_controller_modes).most_common(1)[0][0]
+                if selected_controller_modes
+                else None
+            ),
+            "controller_phase_label": (
+                Counter(selected_controller_phases).most_common(1)[0][0]
+                if selected_controller_phases
+                else None
+            ),
+            "controller_route_reason": selected_controller_reasons[0] if selected_controller_reasons else None,
             "num_runs": len(group),
             "completed_runs": len(successful),
             "failed_runs": len(failures),
@@ -931,6 +979,8 @@ def main() -> None:
             "workload_name",
             "workload_cell",
             "task_type",
+            "controller_selected_mode_name",
+            "controller_phase_label",
             "completed_runs",
             "failed_runs",
             "ttft_ms_mean",
@@ -954,6 +1004,8 @@ def main() -> None:
             "workload_name",
             "workload_cell",
             "task_type",
+            "controller_selected_mode_name",
+            "controller_phase_label",
             "latency_speedup_vs_baseline",
             "throughput_ratio_vs_baseline",
             "energy_per_token_ratio_vs_baseline",
