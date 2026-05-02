@@ -987,7 +987,10 @@ def run_single_benchmark(
     """
     controller_name = runtime_mode.runner_kwargs.get("controller_name")
     if controller_name:
-        decision = route_runtime_workload(workload)
+        decision = route_runtime_workload(
+            workload,
+            num_requests_in_batch=runtime_mode.runner_kwargs.get("request_batch_size", 1),
+        )
         delegated_mode = build_runtime_mode_by_name(decision.selected_mode_name)
         delegated_result = run_single_benchmark(
             runtime_mode=delegated_mode,
