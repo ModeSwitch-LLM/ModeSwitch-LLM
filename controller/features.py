@@ -20,6 +20,7 @@ class RequestFeatures:
     shared_prefix: bool
     batch_pressure: str
     memory_pressure: bool
+    workload_name: Optional[str] = None
     workload_tag: Optional[str] = None
     system_condition: Optional[str] = None
 
@@ -86,21 +87,35 @@ def extract_request_features_from_workload(
     metadata = workload.metadata or {}
     resolved_workload_tag = (
         workload_tag
-        or metadata.get("workload_family")
         or workload.benchmark_suite
+        or metadata.get("workload_family")
+        or metadata.get("benchmark_family")
         or workload.task_type
     )
+
+    shared_prefix = bool(
+        getattr(workload, "repeated_prefix", False)
+        or metadata.get("workload_family") == "shared_prefix"
+    )
+
+    # Preserve the concrete workload name so the router can use measured
+    # workload-specific winners instead of only broad labels like "qa" or
+    # "analysis".
+    base_workload_name = metadata.get("base_workload_name") or getattr(workload, "name", None)
+    if isinstance(base_workload_name, str) and "_v" in base_workload_name:
+        base_workload_name = base_workload_name.rsplit("_v", 1)[0]
 
     return RequestFeatures(
         prompt_tokens=int(getattr(workload, "prompt_tokens_target", 0) or 0),
         expected_output_tokens=int(getattr(workload, "max_new_tokens", 0) or 0),
-        shared_prefix=bool(getattr(workload, "repeated_prefix", False)),
+        shared_prefix=shared_prefix,
         batch_pressure=normalize_batch_pressure(
             batch_pressure=batch_pressure,
             num_requests_in_batch=num_requests_in_batch,
             system_condition_name=getattr(workload, "system_condition_name", None),
         ),
         memory_pressure=bool(getattr(workload, "memory_pressure", False)),
+        workload_name=str(base_workload_name) if base_workload_name is not None else None,
         workload_tag=str(resolved_workload_tag) if resolved_workload_tag is not None else None,
         system_condition=getattr(workload, "system_condition_name", None),
     )
