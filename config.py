@@ -188,7 +188,13 @@ class SystemConfig:
 
     # Baseline mode used for baseline-quality comparisons in postprocessing.
     baseline_reference_mode_name: str = "fp16_baseline"
-    
+
+    # If True, synthetic non-benchmark workloads receive a trial-specific
+    # header before timing. This prevents prefix-caching modes from getting
+    # accidental cache reuse just because the same synthetic prompt is repeated
+    # across trials on one loaded engine.
+    unique_synthetic_prompt_per_trial: bool = True
+
 # =============================================================================
 # Mode definitions
 # =============================================================================
@@ -489,7 +495,10 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         repeated_prefix=True,
         task_type="chat",
         workload_cell="LS",
-        metadata={"workload_family": "shared_prefix"},
+        metadata={
+            "workload_family": "shared_prefix",
+            "repeated_prefix_variants": 10,
+        },
     ),
     WorkloadConfig(
         name="memory_pressure_long_context",
@@ -500,7 +509,10 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         task_type="analysis",
         workload_cell="LS",
         system_condition="mem_pressure_50",
-        metadata={"workload_family": "memory_pressure"},
+        metadata={
+            "workload_family": "memory_pressure",
+            "memory_pressure_variants": 10,
+        },
     ),
     WorkloadConfig(
         name="mmlu_pro_eval",

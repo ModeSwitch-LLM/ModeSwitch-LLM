@@ -394,6 +394,43 @@ def _build_batched_prompts(base_prompt: str, batch_size: int) -> List[str]:
         )
     return prompts
 
+def _should_add_trial_unique_header(workload: RuntimeWorkload) -> bool:
+    """
+    Decide whether to make this timed prompt unique for this trial.
+
+    We only do this for synthetic non-benchmark, non-shared-prefix workloads.
+    This avoids accidental cross-trial prefix-cache reuse while preserving the
+    intended shared-prefix benchmark behavior.
+    """
+    if not getattr(CONFIG.system, "unique_synthetic_prompt_per_trial", False):
+        return False
+
+    if getattr(workload, "repeated_prefix", False):
+        return False
+
+    if getattr(workload, "benchmark_suite", None):
+        return False
+
+    return True
+
+
+def _add_trial_unique_header(
+    prompts: List[str],
+    workload: RuntimeWorkload,
+    trial_index: int,
+) -> List[str]:
+    """
+    Add a unique header at the beginning of synthetic prompts.
+
+    Important: the header goes at the beginning, not the end, so prefix-caching
+    cannot reuse almost the entire repeated synthetic prompt across trials.
+    """
+    header = (
+        f"Unique benchmark trial id: {workload.name} / trial {trial_index}\n"
+        "This identifier is part of the benchmark prompt and should not be discussed.\n\n"
+    )
+    return [header + prompt for prompt in prompts]
+
 
 def _resolve_system_prompt_for_workload(workload: RuntimeWorkload) -> Optional[str]:
     """
@@ -985,12 +1022,17 @@ def run_single_benchmark(
     Returns:
         Finalized BenchmarkResult
     """
-    controller_name = runtime_mode.runner_kwargs.get("controller_name")
+    controller_name = (
+        runtime_mode.runner_kwargs.get("controller_name")
+        or runtime_mode.runtime_kwargs.get("controller_name")
+    )
     if controller_name:
+        route_start_s = now_s(sync_cuda=False)
         decision = route_runtime_workload(
             workload,
             num_requests_in_batch=runtime_mode.runner_kwargs.get("request_batch_size", 1),
         )
+        route_end_s = now_s(sync_cuda=False)
         delegated_mode = build_runtime_mode_by_name(decision.selected_mode_name)
         delegated_result = run_single_benchmark(
             runtime_mode=delegated_mode,
@@ -1003,6 +1045,9 @@ def run_single_benchmark(
         delegated_result.controller_phase_label = decision.classification_label
         delegated_result.controller_estimated_prefill_share_pct = decision.estimated_prefill_share_pct
         delegated_result.controller_route_reason = decision.reason
+        delegated_result.controller_routing_overhead_ms = (route_end_s - route_start_s) * 1000.0
+        delegated_result.controller_decision_source = "online_before_execution"
+        delegated_result.evaluation_scope = "online_request_boundary_controller"
         delegated_result.notes = (
             f"Controller `{controller_name}` routed this request to `{decision.selected_mode_name}`. "
             f"{decision.reason} "
@@ -1070,6 +1115,17 @@ def run_single_benchmark(
         if workload.repeated_prefix and workload.followup_prompt is not None:
             priming_prompts = [workload.prompt]
             timed_prompts = [workload.followup_prompt]
+
+        if _should_add_trial_unique_header(workload):
+            timed_prompts = _add_trial_unique_header(
+                timed_prompts,
+                workload=workload,
+                trial_index=trial_index,
+            )
+            result.notes += (
+                "Synthetic non-benchmark timed prompt received a trial-specific leading header "
+                "to avoid accidental cross-trial prefix-cache reuse. "
+            )
 
         # "Continuous batching" in vLLM is exercised by batching multiple
         # requests through one engine invocation, not by a fake constructor flag.

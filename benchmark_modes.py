@@ -272,26 +272,18 @@ def build_test_plan(
             workload_name,
         )
 
-    # The updated controller project direction needs benchmark workloads in the
-    # normal "controller" profile too, because accuracy retention against FP16
-    # is now a first-class requirement.
-    if test_profile in {"controller", "all"}:
+    # Only include benchmark workloads in the largest profile so the default
+    # curated sweep does not explode in size unexpectedly.
+    if test_profile == "all":
         benchmark_candidate_modes = [
             "fp16_baseline",
             "gptq_4bit",
-            "int8_quant",
             "speculative_decoding",
+            "gptq_plus_prefix_caching",
+            "int8_plus_continuous_batching",
             "prefix_caching",
-            "controller_v1",
+            "continuous_batching",
         ]
-        if test_profile == "all":
-            benchmark_candidate_modes.extend(
-                [
-                    "gptq_plus_prefix_caching",
-                    "int8_plus_continuous_batching",
-                    "continuous_batching",
-                ]
-            )
         for mode_name in benchmark_candidate_modes:
             for workload_name in benchmark_workloads:
                 _add_test_case(
@@ -301,20 +293,6 @@ def build_test_plan(
                     mode_name,
                     workload_name,
                 )
-
-    if test_profile in {"controller", "all"}:
-        controller_workloads = list(dict.fromkeys(baseline_workloads + benchmark_workloads))
-        for workload_name in controller_workloads:
-            _add_test_case(cases, seen, available_mode_names, "controller_v1", workload_name)
-        for variant_id in repeated_variant_ids:
-            _add_test_case(
-                cases,
-                seen,
-                available_mode_names,
-                "controller_v1",
-                "shared_prefix_chat",
-                repeated_prefix_variant=variant_id,
-            )
 
     return cases
 
@@ -448,6 +426,13 @@ def save_summary_csv(results: List[BenchmarkResult], output_path: Path) -> None:
             "evaluation_mode": r.evaluation_mode,
             "benchmark_primary_metric_name": r.benchmark_primary_metric_name,
             "benchmark_primary_metric_value": r.benchmark_primary_metric_value,
+            "controller_selected_mode_name": r.controller_selected_mode_name,
+            "controller_phase_label": r.controller_phase_label,
+            "controller_estimated_prefill_share_pct": r.controller_estimated_prefill_share_pct,
+            "controller_route_reason": r.controller_route_reason,
+            "controller_routing_overhead_ms": r.controller_routing_overhead_ms,
+            "controller_decision_source": r.controller_decision_source,
+            "evaluation_scope": r.evaluation_scope,
             "success": r.success,
             "error_type": r.error_type,
             "total_latency_ms": r.total_latency_ms,
@@ -588,21 +573,6 @@ def build_aggregate_rows(results: List[BenchmarkResult]) -> List[dict]:
             (r.benchmark_primary_metric_name for r in successful if r.benchmark_primary_metric_name),
             next((r.benchmark_primary_metric_name for r in group if r.benchmark_primary_metric_name), None),
         )
-        selected_controller_modes = [
-            r.controller_selected_mode_name
-            for r in successful
-            if getattr(r, "controller_selected_mode_name", None)
-        ]
-        selected_controller_phases = [
-            r.controller_phase_label
-            for r in successful
-            if getattr(r, "controller_phase_label", None)
-        ]
-        selected_controller_reasons = [
-            r.controller_route_reason
-            for r in successful
-            if getattr(r, "controller_route_reason", None)
-        ]
 
         ttft_values = [result.ttft_ms for result in successful if result.ttft_ms is not None]
         latency_values = [result.total_latency_ms for result in successful if result.total_latency_ms is not None]
@@ -626,16 +596,51 @@ def build_aggregate_rows(results: List[BenchmarkResult]) -> List[dict]:
             "evaluation_mode": first.evaluation_mode,
             "benchmark_primary_metric_name": benchmark_primary_metric_name,
             "controller_selected_mode_name": (
-                Counter(selected_controller_modes).most_common(1)[0][0]
-                if selected_controller_modes
+                Counter([
+                    r.controller_selected_mode_name
+                    for r in group
+                    if r.controller_selected_mode_name is not None
+                ]).most_common(1)[0][0]
+                if any(r.controller_selected_mode_name is not None for r in group)
                 else None
             ),
             "controller_phase_label": (
-                Counter(selected_controller_phases).most_common(1)[0][0]
-                if selected_controller_phases
+                Counter([
+                    r.controller_phase_label
+                    for r in group
+                    if r.controller_phase_label is not None
+                ]).most_common(1)[0][0]
+                if any(r.controller_phase_label is not None for r in group)
                 else None
             ),
-            "controller_route_reason": selected_controller_reasons[0] if selected_controller_reasons else None,
+            "controller_estimated_prefill_share_pct_mean": _mean([
+                r.controller_estimated_prefill_share_pct
+                for r in successful
+                if r.controller_estimated_prefill_share_pct is not None
+            ]),
+            "controller_routing_overhead_ms_mean": _mean([
+                r.controller_routing_overhead_ms
+                for r in successful
+                if r.controller_routing_overhead_ms is not None
+            ]),
+            "controller_decision_source": (
+                Counter([
+                    r.controller_decision_source
+                    for r in group
+                    if r.controller_decision_source is not None
+                ]).most_common(1)[0][0]
+                if any(r.controller_decision_source is not None for r in group)
+                else None
+            ),
+            "evaluation_scope": (
+                Counter([
+                    r.evaluation_scope
+                    for r in group
+                    if r.evaluation_scope is not None
+                ]).most_common(1)[0][0]
+                if any(r.evaluation_scope is not None for r in group)
+                else None
+            ),
             "num_runs": len(group),
             "completed_runs": len(successful),
             "failed_runs": len(failures),
@@ -979,8 +984,6 @@ def main() -> None:
             "workload_name",
             "workload_cell",
             "task_type",
-            "controller_selected_mode_name",
-            "controller_phase_label",
             "completed_runs",
             "failed_runs",
             "ttft_ms_mean",
@@ -1004,8 +1007,6 @@ def main() -> None:
             "workload_name",
             "workload_cell",
             "task_type",
-            "controller_selected_mode_name",
-            "controller_phase_label",
             "latency_speedup_vs_baseline",
             "throughput_ratio_vs_baseline",
             "energy_per_token_ratio_vs_baseline",

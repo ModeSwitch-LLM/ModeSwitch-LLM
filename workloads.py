@@ -216,6 +216,16 @@ SHARED_PREFIX = (
     "Instructions: Answer clearly, use concise reasoning, and focus on practical tradeoffs.\n\n"
 )
 
+MEMORY_PRESSURE_SUFFIXES = [
+    "Focus on long retrieved context and KV-cache growth under constrained VRAM.",
+    "Focus on decode-time KV-cache expansion as output length increases.",
+    "Focus on allocator pressure, fragmentation, and large batch-side activations.",
+    "Focus on long-context prompts where cache growth dominates memory use.",
+    "Focus on how quantization changes memory headroom and scheduling behavior.",
+    "Focus on throughput collapse when memory pressure causes less efficient execution.",
+    "Focus on serving stability when long prompts and long generations overlap.",
+    "Focus on the tradeoff between memory footprint, latency, and output length.",
+]
 
 # =============================================================================
 # Prompt generation helpers
@@ -273,6 +283,38 @@ def _build_repeated_prefix_prompt(prompt_tokens: int, variant_id: int = 0) -> st
     base_text = SHARED_PREFIX + suffix
 
     return _expand_text_to_target_length(base_text, prompt_tokens)
+
+def _get_workload_variant_count(
+    workload: WorkloadConfig,
+    default_repeated_prefix_variants: int = 2,
+) -> int:
+    """
+    Resolve how many synthetic variants to generate for a workload.
+
+    Supported metadata keys:
+    - repeated_prefix_variants
+    - memory_pressure_variants
+    - num_variants
+    """
+    metadata = workload.metadata or {}
+
+    if workload.repeated_prefix:
+        return int(
+            metadata.get(
+                "repeated_prefix_variants",
+                metadata.get("num_variants", default_repeated_prefix_variants),
+            )
+        )
+
+    if workload.memory_pressure:
+        return int(
+            metadata.get(
+                "memory_pressure_variants",
+                metadata.get("num_variants", 1),
+            )
+        )
+
+    return 1
 
 def _first_present_value(row: Dict[str, Any], keys: List[str]):
     """
@@ -495,7 +537,7 @@ def _build_repeated_prefix_reference_answer(variant_id: int) -> str:
     return answers[variant_id % len(answers)]
 
 
-def _build_memory_pressure_reference_answer() -> str:
+def _build_memory_pressure_reference_answer(variant_id: int = 0) -> str:
     """
     Reference answer for the memory-pressure workload.
     """
@@ -506,14 +548,16 @@ def _build_memory_pressure_reference_answer() -> str:
         "behavior depends on how model size, prompt length, generated length, and cache growth interact."
     )
 
-def _build_memory_pressure_prompt(prompt_tokens: int) -> str:
+def _build_memory_pressure_prompt(prompt_tokens: int, variant_id: int = 0) -> str:
     """
     Build a large prompt intended for memory-pressure scenarios.
     """
+    suffix = MEMORY_PRESSURE_SUFFIXES[variant_id % len(MEMORY_PRESSURE_SUFFIXES)]
     base_text = (
         "You are analyzing GPU memory behavior during large language model inference. "
         "Discuss how long prompts, large KV caches, quantization, and runtime scheduling "
-        "interact when GPU memory is limited."
+        "interact when GPU memory is limited.\n\n"
+        f"Scenario: {suffix}"
     )
     return _expand_text_to_target_length(base_text, prompt_tokens)
 
@@ -694,10 +738,12 @@ def build_runtime_workload(
         reference_answer = _build_repeated_prefix_reference_answer(repeated_prefix_variant)
         followup_reference_answer = _build_repeated_prefix_reference_answer(repeated_prefix_variant + 1)
     elif workload.memory_pressure:
+        runtime_name = f"{workload.name}_v{repeated_prefix_variant}"
         prompt = _build_memory_pressure_prompt(
             prompt_tokens=workload.prompt_tokens,
+            variant_id=repeated_prefix_variant,
         )
-        reference_answer = _build_memory_pressure_reference_answer()
+        reference_answer = _build_memory_pressure_reference_answer(repeated_prefix_variant)
     else:
         prompt = _build_standard_prompt(
             prompt_tokens=workload.prompt_tokens,
@@ -731,6 +777,8 @@ def build_runtime_workload(
     if workload.repeated_prefix:
         metadata["repeated_prefix_variant"] = repeated_prefix_variant
         metadata["followup_repeated_prefix_variant"] = repeated_prefix_variant + 1
+    elif workload.memory_pressure:
+        metadata["memory_pressure_variant"] = repeated_prefix_variant
 
     return RuntimeWorkload(
         name=runtime_name,
@@ -770,14 +818,18 @@ def build_runtime_workloads_for_name(
             system_condition_name=system_condition_name,
         )
 
-    if workload.repeated_prefix:
+    if workload.repeated_prefix or workload.memory_pressure:
+        variant_count = _get_workload_variant_count(
+            workload,
+            default_repeated_prefix_variants=repeated_prefix_variants,
+        )
         return [
             build_runtime_workload(
                 workload=workload,
                 repeated_prefix_variant=variant_id,
                 system_condition_name=system_condition_name,
             )
-            for variant_id in range(repeated_prefix_variants)
+            for variant_id in range(variant_count)
         ]
 
     return [
@@ -814,6 +866,17 @@ def build_runtime_workload_by_name(
                 f"No example with id '{example_id}' was found in '{base_name}'."
             )
 
+    variant_match = re.fullmatch(r"(.+)_v(\d+)", workload_name)
+    if variant_match:
+        base_name, variant_id_str = variant_match.groups()
+        workload = get_workload_by_name(base_name)
+        if workload.repeated_prefix or workload.memory_pressure:
+            return build_runtime_workload(
+                workload=workload,
+                repeated_prefix_variant=int(variant_id_str),
+                system_condition_name=system_condition_name,
+            )
+
     workload = get_workload_by_name(workload_name)
     return build_runtime_workload(
         workload=workload,
@@ -838,8 +901,12 @@ def get_all_runtime_workloads(
             runtime_workloads.extend(
                 _build_runtime_workloads_from_benchmark_sidecar(workload)
             )
-        elif workload.repeated_prefix:
-            for variant_id in range(repeated_prefix_variants):
+        elif workload.repeated_prefix or workload.memory_pressure:
+            variant_count = _get_workload_variant_count(
+                workload,
+                default_repeated_prefix_variants=repeated_prefix_variants,
+            )
+            for variant_id in range(variant_count):
                 runtime_workloads.append(
                     build_runtime_workload(
                         workload=workload,

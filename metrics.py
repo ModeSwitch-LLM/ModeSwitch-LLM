@@ -132,6 +132,17 @@ class BenchmarkResult:
     benchmark_primary_metric_name: Optional[str] = None
     benchmark_primary_metric_value: Optional[float] = None
 
+    # Controller metadata.
+    # These are populated for online controller runs and for reconstructed
+    # offline controller analyses.
+    controller_selected_mode_name: Optional[str] = None
+    controller_phase_label: Optional[str] = None
+    controller_estimated_prefill_share_pct: Optional[float] = None
+    controller_route_reason: Optional[str] = None
+    controller_routing_overhead_ms: Optional[float] = None
+    controller_decision_source: Optional[str] = None
+    evaluation_scope: Optional[str] = None
+
     # Benchmark accuracy / quality metrics
     mmlu_pro_accuracy: Optional[float] = None
     gsm8k_exact_match_accuracy: Optional[float] = None
@@ -141,12 +152,6 @@ class BenchmarkResult:
     tam_accuracy: Optional[float] = None
     mt_bench_score: Optional[float] = None
     alpacaeval2_lc_win_rate: Optional[float] = None
-
-    # Controller-routing metadata for controller_v1 runs
-    controller_selected_mode_name: Optional[str] = None
-    controller_phase_label: Optional[str] = None
-    controller_estimated_prefill_share_pct: Optional[float] = None
-    controller_route_reason: Optional[str] = None
 
     # Free-form notes / errors
     notes: str = ""

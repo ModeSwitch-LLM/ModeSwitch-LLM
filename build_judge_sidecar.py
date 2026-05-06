@@ -117,12 +117,23 @@ def load_prompt_lookup(benchmark_data_dir: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def latest_results_csv(raw_results_dir: Path) -> Path:
-    paths = sorted(raw_results_dir.glob("dense_final_results_*.csv"))
+    patterns = [
+        "dense_final_results_*.csv",
+        "dense_final_prejudge_results_*.csv",
+        "dense_final_partial_*.csv",
+        "benchmark_results_*.csv",
+    ]
+
+    paths = []
+    for pattern in patterns:
+        paths.extend(raw_results_dir.glob(pattern))
 
     if not paths:
-        raise FileNotFoundError(f"No dense_final_results_*.csv found in {raw_results_dir}")
+        raise FileNotFoundError(
+            f"No dense final / benchmark CSV files found in {raw_results_dir}"
+        )
 
-    return paths[-1]
+    return sorted(paths, key=lambda p: p.stat().st_mtime)[-1]
 
 
 # ============================================================
@@ -372,13 +383,20 @@ def main():
         help="Overwrite existing judge sidecar instead of appending/skipping existing rows.",
     )
 
+    parser.add_argument(
+        "--output-path",
+        type=Path,
+        default=None,
+        help="Optional explicit output sidecar path.",
+    )
+
     args = parser.parse_args()
 
     project_root = args.project_root
     benchmark_data_dir = project_root / "benchmark_data"
     raw_results_dir = project_root / "results" / "raw"
 
-    output_path = benchmark_data_dir / "judge_scores_sidecar.jsonl"
+    output_path = args.output_path or (benchmark_data_dir / "judge_scores_sidecar.jsonl")
 
     results_csv = args.results_csv or latest_results_csv(raw_results_dir)
 
