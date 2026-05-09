@@ -153,7 +153,7 @@ class SystemConfig:
     warmup_runs: int = 1
 
     # Number of measured trials per (mode, workload) pair.
-    num_trials: int = 2
+    num_trials: int = 5
 
     # Whether to clear CUDA cache between runs.
     clear_cuda_cache_between_runs: bool = True
@@ -462,6 +462,10 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         description="Short prompt, short output",
         task_type="qa",
         workload_cell="SS",
+        metadata={
+            "workload_family": "standard_synthetic",
+            "num_variants": 100,
+        },
     ),
     WorkloadConfig(
         name="short_prompt_long_output",
@@ -470,6 +474,10 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         description="Short prompt, long output",
         task_type="qa",
         workload_cell="SL",
+        metadata={
+            "workload_family": "standard_synthetic",
+            "num_variants": 100,
+        },
     ),
     WorkloadConfig(
         name="long_prompt_short_output",
@@ -478,6 +486,10 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         description="Long prompt, short output",
         task_type="analysis",
         workload_cell="LS",
+        metadata={
+            "workload_family": "standard_synthetic",
+            "num_variants": 100,
+        },
     ),
     WorkloadConfig(
         name="long_prompt_long_output",
@@ -486,18 +498,22 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         description="Long prompt, long output",
         task_type="analysis",
         workload_cell="LL",
+        metadata={
+            "workload_family": "standard_synthetic",
+            "num_variants": 100,
+        },
     ),
     WorkloadConfig(
         name="shared_prefix_chat",
         prompt_tokens=1024,
-        max_new_tokens=64,
-        description="Shared-prefix workload for prefix caching experiments",
+        max_new_tokens=128,
+        description="Shared-prefix long-output workload for prefix caching experiments",
         repeated_prefix=True,
         task_type="chat",
-        workload_cell="LS",
+        workload_cell="LL",
         metadata={
             "workload_family": "shared_prefix",
-            "repeated_prefix_variants": 10,
+            "repeated_prefix_variants": 100,
         },
     ),
     WorkloadConfig(
@@ -507,11 +523,11 @@ DEFAULT_WORKLOADS: List[WorkloadConfig] = [
         description="Long-context workload under artificial memory pressure",
         memory_pressure=True,
         task_type="analysis",
-        workload_cell="LS",
+        workload_cell="LL",
         system_condition="mem_pressure_50",
         metadata={
             "workload_family": "memory_pressure",
-            "memory_pressure_variants": 10,
+            "memory_pressure_variants": 100,
         },
     ),
     WorkloadConfig(

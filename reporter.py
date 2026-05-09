@@ -23,6 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from config import CONFIG
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,41 @@ except ImportError:
     _MATPLOTLIB_AVAILABLE = False
     logger.warning("matplotlib/numpy not installed. Plot generation is disabled.")
 
+
+def _collapse_report_workload_name(name):
+    name = str(name)
+    if "__" in name:
+        name = name.split("__", 1)[0]
+    name = re.sub(r"_v\d+$", "", name)
+    return name
+
+
+def _collapse_report_df_for_plotting(df):
+    if df is None or len(df) == 0 or "workload_name" not in df.columns:
+        return df
+
+    out = df.copy()
+    out["workload_name"] = out["workload_name"].apply(_collapse_report_workload_name)
+
+    numeric_cols = out.select_dtypes(include=["number"]).columns.tolist()
+    agg_map = {col: "mean" for col in numeric_cols}
+
+    for col in ["n", "failure_count"]:
+        if col in agg_map:
+            agg_map[col] = "sum"
+
+    non_numeric_cols = [
+        col for col in out.columns
+        if col not in numeric_cols and col not in ["mode_name", "workload_name"]
+    ]
+    for col in non_numeric_cols:
+        agg_map[col] = "first"
+
+    return (
+        out
+        .groupby(["mode_name", "workload_name"], as_index=False)
+        .agg(agg_map)
+    )
 
 # =============================================================================
 # Result-schema fields used by this adapted reporter
@@ -1426,7 +1462,9 @@ def plot_energy_per_token_bar(
     x = np.arange(len(workload_names))
     width = 0.8 / max(len(mode_names), 1)
 
-    fig, ax = plt.subplots(figsize=(max(10, len(workload_names) * 1.4), 6))
+    num_workloads = len(workload_names)
+    fig_width = min(24, max(10, num_workloads * 0.9))
+    fig, ax = plt.subplots(figsize=(fig_width, 6))
 
     for i, mode_name in enumerate(mode_names):
         values = []

@@ -209,12 +209,110 @@ BASE_LONG_PROMPT = (
     "LLM inference modes on a single GPU."
 )
 
+STANDARD_SYNTHETIC_TOPICS = [
+    "LLM inference latency",
+    "GPU memory pressure",
+    "KV-cache growth",
+    "batch scheduling",
+    "prefix caching",
+    "chunked prefill",
+    "speculative decoding",
+    "INT8 quantization",
+    "4-bit quantization",
+    "CUDA graph replay",
+    "throughput under batching",
+    "decode-bound generation",
+    "prefill-heavy prompts",
+    "long-context retrieval",
+    "serving cost reduction",
+    "energy-efficient inference",
+    "single-GPU deployment",
+    "request routing",
+    "quality-preserving optimization",
+    "model-serving tradeoffs",
+]
+
+STANDARD_SYNTHETIC_TASKS = {
+    "SS": [
+        "Give a concise explanation of {topic}.",
+        "State the main tradeoff involved in {topic}.",
+        "Explain why {topic} matters for LLM serving in two short paragraphs.",
+        "List the most important practical concern in {topic} and explain it briefly.",
+    ],
+    "SL": [
+        "Write a detailed explanation of {topic} for an engineering student.",
+        "Explain {topic}, including benefits, limitations, and deployment concerns.",
+        "Compare the practical advantages and risks of {topic} in LLM serving.",
+        "Write a structured technical note about {topic}.",
+    ],
+    "LS": [
+        "Using the context above, answer briefly: what is the key takeaway about {topic}?",
+        "Using the context above, give the most important conclusion about {topic}.",
+        "Using the context above, summarize the main implication of {topic} in one paragraph.",
+        "Using the context above, identify the main bottleneck related to {topic}.",
+    ],
+    "LL": [
+        "Using the context above, write a detailed analysis of {topic}.",
+        "Using the context above, explain the tradeoffs of {topic} in a full technical answer.",
+        "Using the context above, compare how {topic} affects latency, throughput, memory, and energy.",
+        "Using the context above, write a careful deployment recommendation about {topic}.",
+    ],
+}
+
+LONG_CONTEXT_BLOCKS = [
+    (
+        "In modern LLM serving, each request can stress the GPU differently. "
+        "Short prompts with long generations are often decode-heavy, while long prompts "
+        "with short generations are often prefill-heavy. A runtime optimization that helps "
+        "one phase may have little effect on the other."
+    ),
+    (
+        "Quantized inference can reduce memory traffic and model footprint, but it can also "
+        "change kernel behavior and numerical quality. The best mode depends on prompt length, "
+        "output length, batching, cache reuse, and the quality tolerance of the task."
+    ),
+    (
+        "Prefix caching is useful when requests share a long stable prefix, such as a system "
+        "prompt, retrieved document, policy block, or multi-turn chat history. It mainly reduces "
+        "repeated prefill work rather than decode cost."
+    ),
+    (
+        "Memory pressure becomes important when long prompts, long outputs, and multiple requests "
+        "increase KV-cache size. Under constrained VRAM, scheduling and quantization can affect "
+        "both stability and performance."
+    ),
+]
+
 # Shared prefix used for prefix caching experiments
 SHARED_PREFIX = (
     "System: You are an expert assistant helping with efficient AI benchmarking.\n"
     "Context: The user is evaluating inference-time optimizations on a single GPU.\n"
     "Instructions: Answer clearly, use concise reasoning, and focus on practical tradeoffs.\n\n"
 )
+
+SHARED_PREFIX_CONTEXT = (
+    SHARED_PREFIX
+    + "Shared benchmark context: The user is comparing several LLM inference modes on the "
+      "same single-GPU setup. The candidate modes include FP16 baseline, INT8 quantization, "
+      "GPTQ 4-bit quantization, AWQ 4-bit quantization, speculative decoding, prefix caching, "
+      "chunked prefill, continuous batching, and CUDA graphs. The evaluation records latency, "
+      "throughput, energy, GPU memory, prefill time, decode time, and quality metrics. The goal "
+      "is to understand when each mode is useful and when a request-boundary controller should "
+      "route a request to a specialized runtime mode instead of always using one fixed mode.\n"
+)
+
+SHARED_PREFIX_TASKS = [
+    "Task: Explain how prefix caching reduces repeated prefill work.",
+    "Task: Explain when prefix caching is unlikely to help.",
+    "Task: Compare prefix caching with chunked prefill.",
+    "Task: Give a deployment example where many requests share the same prefix.",
+    "Task: Explain how shared chat history creates prefix-cache reuse.",
+    "Task: Explain why prefix caching mostly helps prefill rather than decode.",
+    "Task: Describe how cache eviction could reduce prefix-caching benefits.",
+    "Task: Explain how retrieved context can create repeated prompt prefixes.",
+    "Task: Compare prefix caching against quantization for latency improvement.",
+    "Task: Explain how prefix caching affects energy use during repeated requests.",
+]
 
 MEMORY_PRESSURE_SUFFIXES = [
     "Focus on long retrieved context and KV-cache growth under constrained VRAM.",
@@ -225,6 +323,19 @@ MEMORY_PRESSURE_SUFFIXES = [
     "Focus on throughput collapse when memory pressure causes less efficient execution.",
     "Focus on serving stability when long prompts and long generations overlap.",
     "Focus on the tradeoff between memory footprint, latency, and output length.",
+]
+
+MEMORY_PRESSURE_SCENARIOS = [
+    "A long-document QA request with a large retrieved context.",
+    "A multi-turn chat request with a long conversation history.",
+    "A summarization request over a long technical report.",
+    "A batch of requests arriving while the KV cache is already large.",
+    "A decode-heavy request that generates a long answer under limited VRAM.",
+    "A mixed workload where short and long requests share one GPU.",
+    "A serving setup where memory fragmentation reduces available headroom.",
+    "A controller deciding between FP16, quantization, and cache-based modes.",
+    "A long-context reasoning request close to the model context limit.",
+    "A workload where memory pressure causes throughput collapse.",
 ]
 
 # =============================================================================
@@ -255,14 +366,43 @@ def _expand_text_to_target_length(base_text: str, target_tokens: int) -> str:
     return text
 
 
-def _build_standard_prompt(prompt_tokens: int) -> str:
+def _build_standard_prompt(
+    prompt_tokens: int,
+    max_new_tokens: int,
+    variant_id: int = 0,
+) -> str:
     """
-    Build a standard prompt for short/long workload buckets.
+    Build a synthetic standard prompt variant for SS / SL / LS / LL buckets.
     """
-    if prompt_tokens <= 256:
-        return _expand_text_to_target_length(BASE_SHORT_PROMPT, prompt_tokens)
+    workload_cell = infer_workload_cell(prompt_tokens, max_new_tokens)
 
-    return _expand_text_to_target_length(BASE_LONG_PROMPT, prompt_tokens)
+    topic = STANDARD_SYNTHETIC_TOPICS[
+        variant_id % len(STANDARD_SYNTHETIC_TOPICS)
+    ]
+    task_templates = STANDARD_SYNTHETIC_TASKS[workload_cell]
+    task_template = task_templates[
+        (variant_id // len(STANDARD_SYNTHETIC_TOPICS)) % len(task_templates)
+    ]
+    task = task_template.format(topic=topic)
+
+    if prompt_tokens <= 256:
+        base_text = (
+            "You are a helpful assistant benchmarking LLM inference behavior.\n\n"
+            f"Question: {task}"
+        )
+        return _expand_text_to_target_length(base_text, prompt_tokens)
+
+    context_seed = LONG_CONTEXT_BLOCKS[variant_id % len(LONG_CONTEXT_BLOCKS)]
+    context = (
+        "You are a helpful assistant. Carefully read the following technical context.\n\n"
+        f"{context_seed}\n\n"
+        f"Additional focus area: {topic}. "
+        "Discuss how this focus area changes the balance between prefill work, decode work, "
+        "GPU memory, energy use, throughput, and quality preservation."
+    )
+
+    expanded_context = _expand_text_to_target_length(context, prompt_tokens)
+    return expanded_context.rstrip() + f"\n\nQuestion: {task}"
 
 
 def _build_repeated_prefix_prompt(prompt_tokens: int, variant_id: int = 0) -> str:
@@ -272,17 +412,12 @@ def _build_repeated_prefix_prompt(prompt_tokens: int, variant_id: int = 0) -> st
     The initial shared section stays the same across variants, while the tail
     changes slightly. This makes it useful for prefix caching experiments.
     """
-    suffixes = [
-        "Task: Summarize how prefix caching can reduce repeated prefill work.",
-        "Task: Explain when prefix caching helps and when it may not help.",
-        "Task: Compare prefix caching with chunked prefill in simple language.",
-        "Task: Describe practical workloads where repeated prompt prefixes occur.",
-    ]
-
-    suffix = suffixes[variant_id % len(suffixes)]
-    base_text = SHARED_PREFIX + suffix
-
-    return _expand_text_to_target_length(base_text, prompt_tokens)
+    suffix = SHARED_PREFIX_TASKS[variant_id % len(SHARED_PREFIX_TASKS)]
+    shared_prefix_body = _expand_text_to_target_length(
+        SHARED_PREFIX_CONTEXT,
+        prompt_tokens,
+    )
+    return shared_prefix_body.rstrip() + "\n\n" + suffix
 
 def _get_workload_variant_count(
     workload: WorkloadConfig,
@@ -297,6 +432,9 @@ def _get_workload_variant_count(
     - num_variants
     """
     metadata = workload.metadata or {}
+
+    if workload.benchmark_source_path:
+        return 1
 
     if workload.repeated_prefix:
         return int(
@@ -314,7 +452,7 @@ def _get_workload_variant_count(
             )
         )
 
-    return 1
+    return int(metadata.get("num_variants", 1))
 
 def _first_present_value(row: Dict[str, Any], keys: List[str]):
     """
@@ -553,11 +691,17 @@ def _build_memory_pressure_prompt(prompt_tokens: int, variant_id: int = 0) -> st
     Build a large prompt intended for memory-pressure scenarios.
     """
     suffix = MEMORY_PRESSURE_SUFFIXES[variant_id % len(MEMORY_PRESSURE_SUFFIXES)]
+    scenario = MEMORY_PRESSURE_SCENARIOS[
+        (variant_id // len(MEMORY_PRESSURE_SUFFIXES)) % len(MEMORY_PRESSURE_SCENARIOS)
+    ]
     base_text = (
         "You are analyzing GPU memory behavior during large language model inference. "
         "Discuss how long prompts, large KV caches, quantization, and runtime scheduling "
         "interact when GPU memory is limited.\n\n"
-        f"Scenario: {suffix}"
+        f"Scenario: {scenario}\n"
+        f"Focus: {suffix}\n\n"
+        "Your answer should connect memory footprint, KV-cache growth, throughput, latency, "
+        "energy use, and mode selection."
     )
     return _expand_text_to_target_length(base_text, prompt_tokens)
 
@@ -711,6 +855,7 @@ def build_runtime_workload(
     reference_answer = None
     followup_reference_answer = None
     resolved_system_condition_name = system_condition_name or workload.system_condition or "baseline"
+    variant_count = _get_workload_variant_count(workload)
 
     if workload.benchmark_source_path:
         expanded = _build_runtime_workloads_from_benchmark_sidecar(
@@ -745,8 +890,12 @@ def build_runtime_workload(
         )
         reference_answer = _build_memory_pressure_reference_answer(repeated_prefix_variant)
     else:
+        if variant_count > 1:
+            runtime_name = f"{workload.name}_v{repeated_prefix_variant}"
         prompt = _build_standard_prompt(
             prompt_tokens=workload.prompt_tokens,
+            max_new_tokens=workload.max_new_tokens,
+            variant_id=repeated_prefix_variant,
         )
         reference_answer = _build_standard_reference_answer(workload.prompt_tokens)
 
@@ -779,6 +928,8 @@ def build_runtime_workload(
         metadata["followup_repeated_prefix_variant"] = repeated_prefix_variant + 1
     elif workload.memory_pressure:
         metadata["memory_pressure_variant"] = repeated_prefix_variant
+    else:
+        metadata["synthetic_variant"] = repeated_prefix_variant
 
     return RuntimeWorkload(
         name=runtime_name,
@@ -818,11 +969,12 @@ def build_runtime_workloads_for_name(
             system_condition_name=system_condition_name,
         )
 
-    if workload.repeated_prefix or workload.memory_pressure:
-        variant_count = _get_workload_variant_count(
-            workload,
-            default_repeated_prefix_variants=repeated_prefix_variants,
-        )
+    variant_count = _get_workload_variant_count(
+        workload,
+        default_repeated_prefix_variants=repeated_prefix_variants,
+    )
+
+    if variant_count > 1:
         return [
             build_runtime_workload(
                 workload=workload,
@@ -870,12 +1022,11 @@ def build_runtime_workload_by_name(
     if variant_match:
         base_name, variant_id_str = variant_match.groups()
         workload = get_workload_by_name(base_name)
-        if workload.repeated_prefix or workload.memory_pressure:
-            return build_runtime_workload(
-                workload=workload,
-                repeated_prefix_variant=int(variant_id_str),
-                system_condition_name=system_condition_name,
-            )
+        return build_runtime_workload(
+            workload=workload,
+            repeated_prefix_variant=int(variant_id_str),
+            system_condition_name=system_condition_name,
+        )
 
     workload = get_workload_by_name(workload_name)
     return build_runtime_workload(
@@ -901,7 +1052,7 @@ def get_all_runtime_workloads(
             runtime_workloads.extend(
                 _build_runtime_workloads_from_benchmark_sidecar(workload)
             )
-        elif workload.repeated_prefix or workload.memory_pressure:
+        else:
             variant_count = _get_workload_variant_count(
                 workload,
                 default_repeated_prefix_variants=repeated_prefix_variants,
@@ -913,10 +1064,6 @@ def get_all_runtime_workloads(
                         repeated_prefix_variant=variant_id,
                     )
                 )
-        else:
-            runtime_workloads.append(
-                build_runtime_workload(workload=workload)
-            )
 
     return runtime_workloads
 
