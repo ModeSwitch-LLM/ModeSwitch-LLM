@@ -1,19 +1,3 @@
-# ============================================================
-# build_judge_sidecar.py
-# ============================================================
-# Builds benchmark_data/judge_scores_sidecar.jsonl for:
-# - MT-Bench-style open-ended answer quality
-# - AlpacaEval-style pairwise win rate against fp16_baseline
-#
-# Inputs:
-# - results/raw/dense_final_results_*.csv
-# - benchmark_data/mt_bench_eval.jsonl
-# - benchmark_data/alpacaeval2_lc_eval.jsonl
-#
-# Output:
-# - benchmark_data/judge_scores_sidecar.jsonl
-# ============================================================
-
 from __future__ import annotations
 
 import argparse
