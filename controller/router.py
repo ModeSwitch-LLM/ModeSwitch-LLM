@@ -1,3 +1,24 @@
+"""
+# ============================================================================
+# ModeSwitch-LLM Request Router
+# ============================================================================
+# This module routes each incoming workload to one fixed inference mode.
+#
+# Main tasks:
+# - Extracts request-level routing signals from RuntimeWorkload objects.
+# - Classifies requests as batched, shared-prefix, memory-pressure, prefill-heavy,
+#   decode-heavy, benchmark-style, or generic serving requests.
+# - Selects one fixed inference mode before generation begins.
+# - Uses rule-based routing based on measured benchmark results.
+# - Returns an interpretable routing decision with the selected mode, label,
+#   estimated prefill share, and explanation.
+#
+# Usage example:
+# decision = route_runtime_workload(workload, num_requests_in_batch=4)
+# print(decision.selected_mode_name, decision.reason)
+# ============================================================================
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

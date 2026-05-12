@@ -1,15 +1,21 @@
 """
-modes.py
-
-Backend-facing mode utilities for ModeSwitch-LLM.
-
-Purpose:
-- interpret abstract fixed inference modes from config.py
-- convert them into backend/runtime-specific argument dictionaries
-
-Design principle:
-config.py = what modes exist
-modes.py  = how those modes map to runnable settings
+# ============================================================================
+# ModeSwitch-LLM Runtime Mode Builder
+# ============================================================================
+# Converts high-level inference-mode configs into backend-ready runtime modes.
+#
+# Main tasks:
+# - Validates configured inference modes before execution.
+# - Builds vLLM, Transformers, and TGI runtime keyword arguments.
+# - Separates backend constructor settings from runner-only benchmark controls.
+# - Creates RuntimeMode objects consumed by model_loader.py and runner.py.
+# - Resolves modes by name from the project config.
+# - Builds hybrid modes such as GPTQ plus prefix caching.
+# - Defines the default hybrid-mode registry used by benchmark scripts.
+#
+# Usage:
+# from modes import build_runtime_mode_by_name, get_all_runtime_modes
+# ============================================================================
 """
 
 from dataclasses import dataclass, asdict

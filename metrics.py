@@ -1,17 +1,24 @@
 """
-metrics.py
-
-Metric computation utilities for ModeSwitch-LLM.
-
-Purpose:
-- define the standard benchmark result format
-- compute latency and throughput metrics from raw timing data
-- capture GPU memory statistics
-- provide a clean result object that runner.py can save/export
-
-Design principle:
-runner.py should focus on execution
-metrics.py should focus on measurement + metric calculation
+# ============================================================================
+# ModeSwitch-LLM Benchmark Metrics and Result Schema
+# ============================================================================
+# Shared metric utilities and result schema for ModeSwitch-LLM benchmark runs.
+#
+# Main tasks:
+# - Defines the BenchmarkResult dataclass used to store one benchmark run.
+# - Computes timing metrics such as TTFT, total latency, decode latency, and TBT.
+# - Computes throughput metrics for single-request and batched runs.
+# - Collects GPU memory and CPU RAM usage when available.
+# - Computes energy and energy-per-token from power measurements.
+# - Provides lightweight quality metrics such as exact match, token F1, ROUGE-L,
+#   multiple-choice accuracy, and final-answer exact match.
+# - Computes benchmark-specific metrics for MMLU-Pro, GSM8K, TruthfulQA, GPQA,
+#   MLU, TAM, MT-Bench, and AlpacaEval-style workloads.
+# - Finalizes partially populated BenchmarkResult objects before export.
+#
+# Usage:
+# from metrics import BenchmarkResult, finalize_benchmark_result
+# ============================================================================
 """
 
 from dataclasses import dataclass, asdict, field

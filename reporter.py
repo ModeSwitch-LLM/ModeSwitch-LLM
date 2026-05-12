@@ -1,15 +1,22 @@
 """
-==============================================================================
- reporter.py
-==============================================================================
-
-Purpose:
-- load raw benchmark results produced by ModeSwitch-LLM
-- compute grouped aggregate statistics across repeated trials
-- compare each mode against the fp16_baseline on the same workload
-- quantify whether a workload is prefill-dominated or decode-dominated
-- generate a markdown summary plus optional plots for paper/report use
-
+# ============================================================================
+# ModeSwitch-LLM Report Generator
+# ============================================================================
+# Builds analysis tables, plots, and markdown reports from benchmark results.
+#
+# Main tasks:
+# - Loads raw benchmark results from JSON or CSV files.
+# - Normalizes workload names, benchmark metadata, and system-condition labels.
+# - Aggregates latency, throughput, memory, energy, and quality metrics.
+# - Computes deltas, speedups, energy ratios, and phase-dominance summaries.
+# - Identifies Pareto-style tradeoffs and best modes per workload.
+# - Generates CSV/JSON report artifacts for downstream analysis.
+# - Creates optional plots for latency, energy, memory, and phase behavior.
+# - Writes a human-readable markdown report for final interpretation.
+#
+# Run example:
+# python reporter.py results/raw/dense_final_results.json --output-dir results/report --quality-metric auto
+# ============================================================================
 """
 
 from __future__ import annotations

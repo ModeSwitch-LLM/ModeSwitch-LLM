@@ -1,3 +1,22 @@
+"""
+# ============================================================================
+# ModeSwitch-LLM Request Feature Extraction
+# ============================================================================
+# This module builds cheap static features for the request-boundary controller.
+#
+# Main tasks:
+# - Defines the RequestFeatures schema used by the controller.
+# - Computes simple request-level signals before inference starts.
+# - Normalizes batching hints into normal / medium / high pressure labels.
+# - Detects shared-prefix, memory-pressure, benchmark, and workload-family tags.
+# - Preserves the base workload name so the router can use measured winners.
+#
+# Usage example:
+# features = extract_request_features_from_workload(workload, num_requests_in_batch=4)
+# print(features.prompt_tokens, features.output_to_prompt_ratio)
+# ============================================================================
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

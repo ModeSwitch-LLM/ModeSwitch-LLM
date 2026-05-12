@@ -1,16 +1,20 @@
 """
-model_loader.py
-
-Model/backend loading utilities for ModeSwitch-LLM.
-
-Purpose:
-- load the tokenizer and inference backend for a given RuntimeMode
-- keep backend-specific loading logic isolated from benchmarking code
-- provide a standard loaded object that runner.py can consume
-
-Current design:
-- starts with vLLM as the primary supported backend
-- keeps room for Transformers / TGI later
+# ============================================================================
+# ModeSwitch-LLM Model Loading Utilities
+# ============================================================================
+# Backend-aware model and tokenizer loader for ModeSwitch-LLM benchmark runs.
+#
+# Main tasks:
+# - Defines a standard LoadedModelBundle returned by all loaders.
+# - Resolves Hugging Face model, tokenizer, and authentication settings.
+# - Lazily imports and initializes vLLM AsyncLLMEngine for streamed inference.
+# - Provides a fallback Transformers backend for non-vLLM experiments.
+# - Keeps quantized, speculative, cache, and scheduler modes tied to RuntimeMode.
+# - Cleans up loaded model bundles between benchmark sweeps.
+#
+# Usage:
+# from loader import load_model_for_mode, unload_model
+# ============================================================================
 """
 
 from dataclasses import dataclass

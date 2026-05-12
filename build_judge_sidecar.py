@@ -1,3 +1,25 @@
+"""
+# ============================================================================
+# External Judge Score Sidecar Builder
+# ============================================================================
+# This script scores generated benchmark outputs using an OpenAI judge model.
+#
+# Main tasks:
+# - Loads the latest dense benchmark results CSV.
+# - Finds generated answers and prompts for judge-based benchmark workloads.
+# - Scores MT-Bench-style outputs with a single-answer rubric.
+# - Scores AlpacaEval-style outputs with pairwise comparison against FP16.
+# - Writes judge scores to a resumable JSONL sidecar file.
+# - Skips already-judged rows unless overwrite mode is enabled.
+#
+# Run example:
+# python build_judge_scores_sidecar.py \
+#   --project-root /scratch/as18181/ModeSwitch-LLM/ModeSwitch-LLM \
+#   --judge-model gpt-4o-mini \
+#   --max-rows 20
+# ============================================================================
+"""
+
 from __future__ import annotations
 
 import argparse

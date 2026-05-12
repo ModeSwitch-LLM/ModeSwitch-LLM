@@ -1,16 +1,21 @@
 """
-workloads.py
-
-Workload construction utilities for ModeSwitch-LLM.
-
-Purpose:
-- convert abstract workload definitions from config.py into runnable prompts
-- create prompt text for short/long/repeated-prefix workloads
-- provide a clean workload object for runner.py
-
-Design principle:
-config.py    = what workload buckets exist
-workloads.py = how those workload buckets become actual benchmark inputs
+# ============================================================================
+# ModeSwitch-LLM Workload Construction
+# ============================================================================
+# Builds runtime-ready workloads for synthetic, stress-test, and benchmark runs.
+#
+# Main tasks:
+# - Defines system-condition metadata for baseline, memory-pressure, and batch runs.
+# - Defines the RuntimeWorkload dataclass consumed by the benchmark runner.
+# - Builds synthetic SS / SL / LS / LL prompt variants from token-budget settings.
+# - Builds shared-prefix and memory-pressure workloads for deployment-style tests.
+# - Loads benchmark sidecar files from JSONL, JSON, or CSV.
+# - Converts benchmark rows into prompts, references, labels, and metadata.
+# - Provides helpers for expanding configured workloads into runnable workloads.
+#
+# Usage:
+# from workloads import build_runtime_workloads_for_name, get_all_runtime_workloads
+# ============================================================================
 """
 
 from enum import Enum

@@ -1,15 +1,21 @@
 """
-config.py
-
-Central configuration file for the ModeSwitch-LLM benchmarking pipeline.
-
-This file stores:
-- global experiment settings
-- model/runtime configuration
-- candidate fixed modes
-- workload groups
-- output/logging paths
-- benchmark defaults
+# ============================================================================
+# ModeSwitch-LLM Experiment Configuration
+# ============================================================================
+# Central configuration module for the ModeSwitch-LLM benchmarking pipeline.
+#
+# Main tasks:
+# - Defines standard project paths for raw results, processed outputs, plots,
+#   logs, temporary files, and benchmark sidecar data.
+# - Stores model, generation, and system-level runtime settings.
+# - Defines all fixed inference modes used in the benchmark sweep.
+# - Defines synthetic, stress-test, and benchmark-backed workloads.
+# - Provides helper functions for fetching enabled modes and workload configs.
+# - Creates the standard output directories when imported.
+#
+# Usage:
+# from config import CONFIG, get_enabled_modes, get_workload_by_name
+# ============================================================================
 """
 
 from dataclasses import dataclass, field

@@ -1,15 +1,20 @@
 """
-benchmark_modes.py
-
-Full benchmark sweep script for ModeSwitch-LLM.
-
-Purpose:
-- run all enabled modes across all configured workloads and trials
-- collect benchmark results
-- save outputs to CSV and JSON for later analysis
-
-Design principle:
-This file is the top-level experiment driver.
+# ============================================================================
+# ModeSwitch-LLM Curated Benchmark Sweep
+# ============================================================================
+# This script runs a curated benchmark plan across inference modes and workloads.
+#
+# Main tasks:
+# - Builds a focused benchmark plan instead of sweeping every mode/workload pair.
+# - Runs FP16, quantized, speculative-decoding, prefix-caching, and hybrid modes.
+# - Captures per-run logs while keeping console output compact.
+# - Measures latency, throughput, energy/token, memory, and quality metrics.
+# - Adds baseline-similarity scores using ROUGE-L against FP16 outputs.
+# - Saves raw JSON/CSV results, summary CSVs, aggregate tables, and comparison tables.
+#
+# Run example:
+# python benchmark_modes.py
+# ============================================================================
 """
 
 from __future__ import annotations

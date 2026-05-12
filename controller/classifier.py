@@ -1,3 +1,23 @@
+"""
+# ============================================================================
+# ModeSwitch-LLM Request Classification
+# ============================================================================
+# This module classifies each request into a coarse routing regime.
+#
+# Main tasks:
+# - Defines the ControllerClassification schema used by the router.
+# - Estimates whether a request is likely prefill-heavy or decode-heavy.
+# - Uses cheap static request features instead of a learned classifier.
+# - Detects high-batch-pressure and shared-prefix cases before generic routing.
+# - Provides interpretable classification labels and reasons for logging.
+#
+# Usage example:
+# features = extract_request_features_from_workload(workload)
+# classification = classify_request(features)
+# print(classification.label, classification.estimated_prefill_share_pct)
+# ============================================================================
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

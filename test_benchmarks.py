@@ -1,3 +1,23 @@
+"""
+# ============================================================================
+# ModeSwitch-LLM Reporter Unit Tests
+# ============================================================================
+# Unit tests for the reporting, aggregation, delta, and workload-summary logic.
+#
+# Main tasks:
+# - Builds fake benchmark-result rows for deterministic reporter tests.
+# - Tests workload-cell and system-condition inference.
+# - Tests metric aggregation while excluding failed runs.
+# - Tests failure summaries, delta tables, phase dominance, and Pareto frontier logic.
+# - Verifies hybrid runtime-mode resolution for GPTQ plus prefix caching and INT8
+#   plus continuous batching.
+# - Tests Markdown report generation from aggregated benchmark outputs.
+#
+# Run example:
+# python test_reporter.py
+# ============================================================================
+"""
+
 from __future__ import annotations
 
 import tempfile

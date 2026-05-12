@@ -1,17 +1,24 @@
 """
-runner.py
-
-Execution utilities for ModeSwitch-LLM.
-
-Purpose:
-- run one benchmark trial for one (mode, workload) pair
-- coordinate model loading, prompt construction, generation, and metric capture
-- return a finalized BenchmarkResult object
-
-Design principle:
-runner.py = execution orchestration
-metrics.py = metric computation
+# ============================================================================
+# ModeSwitch-LLM Benchmark Runner
+# ============================================================================
+# Executes one benchmark trial for a selected runtime mode and workload.
+#
+# Main tasks:
+# - Runs vLLM or Transformers generation with streamed timing.
+# - Measures TTFT, TBT, total latency, throughput, memory, and energy.
+# - Applies optional artificial GPU memory pressure for stress-test workloads.
+# - Supports continuous-batching runs through concurrent vLLM requests.
+# - Handles shared-prefix priming for prefix-caching experiments.
+# - Applies benchmark-specific prompt formatting and quality scoring.
+# - Supports online controller routing before request execution.
+# - Finalizes BenchmarkResult objects for downstream reporting.
+#
+# Usage:
+# from runner import run_single_benchmark, run_single_benchmark_by_name
+# ============================================================================
 """
+
 import asyncio
 import logging
 import re
