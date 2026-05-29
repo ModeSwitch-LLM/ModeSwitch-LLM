@@ -478,36 +478,6 @@ ModeSwitch-LLM shows that simple request-aware routing can recover substantial i
 
 ---
 
-## Citation
-
-If you use ModeSwitch-LLM or build on this work, please cite the paper:
-
-```bibtex
-@article{sunesh2026modeswitchllm,
-  title={ModeSwitch-LLM: A Lightweight Phase-Aware Controller for Cross-Mode LLM Inference on a Single GPU},
-  author={Sunesh, Aman and Alshehhi, Ali and Dhakne, Hivansh},
-  journal={arXiv preprint arXiv:2605.23057},
-  year={2026},
-  doi={10.48550/arXiv.2605.23057},
-  url={https://arxiv.org/abs/2605.23057}
-}
-```
-
-For the archived software release, cite:
-
-```bibtex
-@software{sunesh2026modeswitchllm_software,
-  author={Sunesh, Aman and Alshehhi, Ali and Dhakne, Hivansh},
-  title={ModeSwitch-LLM: A Lightweight Phase-Aware Controller for Cross-Mode LLM Inference on a Single GPU},
-  year={2026},
-  publisher={Zenodo},
-  version={v0.1.0-arxiv},
-  doi={10.5281/zenodo.20334250},
-  url={https://doi.org/10.5281/zenodo.20334250}
-}
-```
----
-
 ## License
 
 Copyright 2026 ModeSwitch-LLM contributors.
